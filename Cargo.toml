@@ -1,23 +1,17 @@
 [package]
-authors = ['Narrowlink <opensource@narrowlink.com>']
-description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for Tun device'
+authors = ['Narrowlink <opensource@narrowlink.com>', 'Nullchinchilla <nullchinchilla@pm.me>']
+description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for transparent proxies'
 name = "ipstack"
 version = "0.0.10"
 edition = "2021"
 license = "Apache-2.0"
-repository = 'https://github.com/narrowlink/ipstack'
+repository = 'https://github.com/geph-official/ipstack'
 # homepage = 'https://github.com/narrowlink/ipstack'
 readme = "README.md"
 
 [dependencies]
 ahash = "0.8"
-tokio = { version = "1.37", features = [
-    "sync",
-    "rt",
-    "time",
-    "io-util",
-    "macros",
-], default-features = false }
+
 etherparse = { version = "0.14", default-features = false, features = ["std"] }
 thiserror = { version = "1.0", default-features = false }
 log = { version = "0.4", default-features = false }
@@ -25,46 +19,15 @@ rand = { version = "0.8.5", default-features = false, features = [
     "std",
     "std_rng",
 ] }
+anyhow = "1.0.83"
+bytes = "1.6.0"
+async-channel = "2.3.0"
+async-executor = "1.11.0"
+futures-lite = "2.3.0"
+parking_lot = "0.12.2"
+async-io = "2.3.2"
+pollster = "0.3.0"
 
 [dev-dependencies]
-tokio = { version = "1.37", features = [
-    "rt-multi-thread",
-], default-features = false }
-clap = { version = "4.5", features = ["derive"] }
-env_logger = "0.11"
-udp-stream = { version = "0.0", default-features = false }
-
-# Benchmarks
-criterion = { version = "0.5" }
-
-#tun2.rs example
-tun2 = { version = "1.3", features = ["async"] }
-
-#tun_wintun.rs example
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
-tun = { version = "0.6.1", features = ["async"], default-features = false }
-[target.'cfg(target_os = "windows")'.dev-dependencies]
-wintun = { version = "0.4", default-features = false }
-
-[profile.release]
-opt-level = 's'          # Optimize for size (with loop vectorization enabled).
-lto = true               # Enable Link Time Optimization
-codegen-units = 1        # Reduce number of codegen units to increase optimizations.
-panic = "abort"          # Abort on panic
-debug = false            # Strip debug symbols from the binary.
-rpath = false            # Do not embed the path to the dynamic library in the binary.
-debug-assertions = false # Remove assertions from the binary.
-incremental = false      # Disable incremental compilation.
-overflow-checks = false  # Disable overflow checks.
-strip = true             # Automatically strip symbols from the binary.
-
-# Optimize for performance *and* compilation time
-[profile.bench]
-# Inherits from `release` profile
-opt-level = 3
-lto = false
-codegen-units = 16
-debug = true # Enable debug info for `perf(1)`
-incremental = true
-strip = "none"
+criterion="0.5"
 

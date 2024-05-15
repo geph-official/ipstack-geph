@@ -1,4 +1,3 @@
-use crate::error::IpStackError;
 use etherparse::{Ipv4Header, Ipv6Header, NetSlice, SlicedPacket, TcpHeader, UdpHeader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -46,11 +45,10 @@ pub struct NetworkPacket {
     pub(crate) transport: TransportHeader,
     pub(crate) payload: Vec<u8>,
 }
-
 impl NetworkPacket {
-    pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
-        let p = SlicedPacket::from_ip(buf).map_err(|_| IpStackError::InvalidPacket)?;
-        let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
+    pub fn parse(buf: &[u8]) -> anyhow::Result<Self> {
+        let p = SlicedPacket::from_ip(buf).map_err(|_| anyhow::anyhow!("InvalidPacket"))?;
+        let ip = p.net.ok_or_else(|| anyhow::anyhow!("InvalidPacket"))?;
 
         let (ip, ip_payload) = match ip {
             NetSlice::Ipv4(ip) => (
@@ -122,7 +120,7 @@ impl NetworkPacket {
             tcp: matches!(self.transport, TransportHeader::Tcp(_)),
         }
     }
-    pub fn to_bytes(&self) -> Result<Vec<u8>, IpStackError> {
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
         match self.ip {
             IpHeader::Ipv4(ref ip) => ip.write(&mut buf)?,
@@ -143,7 +141,6 @@ impl NetworkPacket {
         }
     }
 }
-
 #[derive(Debug, Clone)]
 pub(super) struct TcpHeaderWrapper {
     header: TcpHeader,

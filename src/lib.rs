@@ -3,53 +3,31 @@ use crate::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
 use ahash::AHashMap;
+use async_channel::{Receiver, Sender};
+use async_executor::Executor;
+use bytes::Bytes;
 use log::{error, trace};
 use packet::{NetworkPacket, NetworkTuple};
+use parking_lot::Mutex;
 use std::{
     collections::hash_map::Entry::{Occupied, Vacant},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    select,
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    task::JoinHandle,
-};
 
-pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
-pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
+pub(crate) type PacketSender = Sender<NetworkPacket>;
+pub(crate) type PacketReceiver = Receiver<NetworkPacket>;
 pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
 
-mod error;
 mod packet;
 pub mod stream;
 
-pub use self::error::{IpStackError, Result};
-
 const DROP_TTL: u8 = 0;
 
-#[cfg(unix)]
 const TTL: u8 = 64;
-
-#[cfg(windows)]
-const TTL: u8 = 128;
-
-#[cfg(unix)]
-const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
-
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-const TUN_PROTO_IP6: [u8; 2] = [0x86, 0xdd];
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-const TUN_PROTO_IP4: [u8; 2] = [0x08, 0x00];
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x0A];
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
 pub struct IpStackConfig {
     pub mtu: u16,
-    pub packet_information: bool,
+
     pub tcp_timeout: Duration,
     pub udp_timeout: Duration,
 }
@@ -58,99 +36,74 @@ impl Default for IpStackConfig {
     fn default() -> Self {
         IpStackConfig {
             mtu: u16::MAX,
-            packet_information: false,
+
             tcp_timeout: Duration::from_secs(60),
             udp_timeout: Duration::from_secs(30),
         }
     }
 }
 
-impl IpStackConfig {
-    pub fn tcp_timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.tcp_timeout = timeout;
-        self
-    }
-    pub fn udp_timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.udp_timeout = timeout;
-        self
-    }
-    pub fn mtu(&mut self, mtu: u16) -> &mut Self {
-        self.mtu = mtu;
-        self
-    }
-    pub fn packet_information(&mut self, packet_information: bool) -> &mut Self {
-        self.packet_information = packet_information;
-        self
-    }
-}
-
 pub struct IpStack {
-    accept_receiver: UnboundedReceiver<IpStackStream>,
-    pub handle: JoinHandle<Result<()>>,
+    accept_receiver: Receiver<IpStackStream>,
+    exec: Executor<'static>,
 }
 
 impl IpStack {
-    pub fn new<D>(config: IpStackConfig, device: D) -> IpStack
-    where
-        D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
-        let handle = run(config, device, accept_sender);
+    pub fn new(
+        config: IpStackConfig,
+        recv_packet: Receiver<Bytes>,
+        send_packet: Sender<Bytes>,
+    ) -> IpStack {
+        let (accept_sender, accept_receiver) = async_channel::unbounded();
+        let exec = Executor::new();
+        exec.spawn(run(config, recv_packet, send_packet, accept_sender))
+            .detach();
 
         IpStack {
             accept_receiver,
-            handle,
+            exec,
         }
     }
 
-    pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
-        self.accept_receiver
-            .recv()
+    pub async fn accept(&self) -> anyhow::Result<IpStackStream> {
+        self.exec
+            .run(async { Ok(self.accept_receiver.recv().await?) })
             .await
-            .ok_or(IpStackError::AcceptError)
     }
 }
 
-fn run<D>(
+async fn run(
     config: IpStackConfig,
-    mut device: D,
-    accept_sender: UnboundedSender<IpStackStream>,
-) -> JoinHandle<Result<()>>
-where
-    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut sessions: SessionCollection = AHashMap::new();
-    let pi = config.packet_information;
-    let offset = if pi && cfg!(unix) { 4 } else { 0 };
-    let mut buffer = [0_u8; u16::MAX as usize + 4];
-    let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+    recv_packet: Receiver<Bytes>,
+    send_packet: Sender<Bytes>,
+    accept_sender: Sender<IpStackStream>,
+) -> anyhow::Result<()> {
+    let sessions: SessionCollection = AHashMap::new();
+    let sessions = Mutex::new(sessions);
 
-    tokio::spawn(async move {
+    let (pkt_sender, pkt_receiver) = async_channel::unbounded::<NetworkPacket>();
+
+    let accept_loop = async {
         loop {
-            select! {
-                Ok(n) = device.read(&mut buffer) => {
-                    if let Some(stream) = process_device_read(
-                        &buffer[offset..n],
-                        &mut sessions,
-                        pkt_sender.clone(),
-                        &config,
-                    ) {
-                        accept_sender.send(stream)?;
-                    }
-                }
-                Some(packet) = pkt_receiver.recv() => {
-                    process_upstream_recv(
-                        packet,
-                        &mut sessions,
-                        &mut device,
-                        #[cfg(unix)]
-                        pi,
-                    )
-                    .await?;
-                }
+            let packet = recv_packet.recv().await?;
+            let mut sessions = sessions.lock();
+            if let Some(stream) =
+                process_device_read(&packet, &mut sessions, pkt_sender.clone(), &config)
+            {
+                let _ = accept_sender.try_send(stream);
             }
         }
-    })
+    };
+
+    let inject_loop = async {
+        loop {
+            let packet = pkt_receiver.recv().await?;
+            let mut sessions = sessions.lock();
+            process_upstream_recv(packet, &mut sessions, send_packet.clone())?;
+        }
+    };
+
+    futures_lite::future::race(accept_loop, inject_loop).await
 }
 
 fn process_device_read(
@@ -178,9 +131,8 @@ fn process_device_read(
 
     match sessions.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
-            if let Err(e) = entry.get().send(packet) {
-                trace!("New stream because: {}", e);
-                create_stream(e.0, config, pkt_sender).map(|s| {
+            if let Err(async_channel::TrySendError::Full(e)) = entry.get().try_send(packet) {
+                create_stream(e, config, pkt_sender).map(|s| {
                     entry.insert(s.0);
                     s.1
                 })
@@ -212,11 +164,8 @@ fn create_stream(
             ) {
                 Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
-                    if matches!(e, IpStackError::InvalidTcpPacket) {
-                        trace!("Invalid TCP packet");
-                    } else {
-                        error!("IpStackTcpStream::new failed \"{}\"", e);
-                    }
+                    error!("IpStackTcpStream::new failed \"{}\"", e);
+
                     None
                 }
             }
@@ -238,15 +187,11 @@ fn create_stream(
     }
 }
 
-async fn process_upstream_recv<D>(
+fn process_upstream_recv(
     packet: NetworkPacket,
     sessions: &mut SessionCollection,
-    device: &mut D,
-    #[cfg(unix)] packet_information: bool,
-) -> Result<()>
-where
-    D: AsyncWrite + Unpin + 'static,
-{
+    device: Sender<Bytes>,
+) -> anyhow::Result<()> {
     if packet.ttl() == 0 {
         sessions.remove(&packet.reverse_network_tuple());
         return Ok(());
@@ -256,16 +201,13 @@ where
         trace!("to_bytes error");
         return Ok(());
     };
-    #[cfg(unix)]
-    if packet_information {
-        if packet.src_addr().is_ipv4() {
-            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
-        } else {
-            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
-        }
-    }
-    device.write_all(&packet_bytes).await?;
+
+    let _ = device.try_send(packet_bytes.into());
     // device.flush().await.unwrap();
 
     Ok(())
+}
+
+pub trait Device {
+    fn read_packet(&self) -> Bytes;
 }

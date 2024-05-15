@@ -1,6 +1,11 @@
+use async_io::Timer;
+
 use crate::packet::TcpHeaderWrapper;
-use std::{collections::BTreeMap, pin::Pin, time::Duration};
-use tokio::time::Sleep;
+use std::{
+    collections::BTreeMap,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
@@ -30,7 +35,7 @@ pub(super) struct Tcb {
     pub(super) retransmission: Option<u32>,
     ack: u32,
     last_ack: u32,
-    pub(super) timeout: Pin<Box<Sleep>>,
+    pub(super) timeout: Pin<Box<Timer>>,
     tcp_timeout: Duration,
     recv_window: u16,
     send_window: u16,
@@ -46,14 +51,14 @@ impl Tcb {
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::random::<u32>();
-        let deadline = tokio::time::Instant::now() + tcp_timeout;
+        let deadline = Instant::now() + tcp_timeout;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
             tcp_timeout,
-            timeout: Box::pin(tokio::time::sleep_until(deadline)),
+            timeout: Box::pin(Timer::at(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::SynReceived(false),
@@ -196,8 +201,8 @@ impl Tcb {
     }
 
     pub(crate) fn reset_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.tcp_timeout;
-        self.timeout.as_mut().reset(deadline);
+        let deadline = Instant::now() + self.tcp_timeout;
+        self.timeout.as_mut().set_at(deadline);
     }
 }
 

@@ -1,24 +1,22 @@
 use crate::{
     packet::{IpHeader, NetworkPacket, TransportHeader},
-    IpStackError, PacketReceiver, PacketSender, TTL,
+    PacketReceiver, PacketSender, TTL,
 };
+use async_io::Timer;
+use bytes::BufMut as _;
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
+use futures_lite::{AsyncRead, AsyncWrite, StreamExt};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
-    time::Sleep,
-};
 
 #[derive(Debug)]
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     stream_sender: PacketSender,
-    stream_receiver: PacketReceiver,
+    stream_receiver: Pin<Box<PacketReceiver>>,
     pkt_sender: PacketSender,
     first_payload: Option<Vec<u8>>,
-    timeout: Pin<Box<Sleep>>,
+    timeout: Pin<Box<Timer>>,
     udp_timeout: Duration,
     mtu: u16,
 }
@@ -32,16 +30,16 @@ impl IpStackUdpStream {
         mtu: u16,
         udp_timeout: Duration,
     ) -> Self {
-        let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
-        let deadline = tokio::time::Instant::now() + udp_timeout;
+        let (stream_sender, stream_receiver) = async_channel::unbounded::<NetworkPacket>();
+        let deadline = std::time::Instant::now() + udp_timeout;
         IpStackUdpStream {
             src_addr,
             dst_addr,
             stream_sender,
-            stream_receiver,
+            stream_receiver: Box::pin(stream_receiver),
             pkt_sender,
             first_payload: Some(payload),
-            timeout: Box::pin(tokio::time::sleep_until(deadline)),
+            timeout: Box::pin(Timer::at(deadline)),
             udp_timeout,
             mtu,
         }
@@ -51,23 +49,20 @@ impl IpStackUdpStream {
         self.stream_sender.clone()
     }
 
-    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
+    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> anyhow::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets())
-                    .map_err(IpStackError::from)?;
+                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets())?;
                 let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
                 payload.truncate(line_buffer as usize);
-                ip_h.set_payload_len(payload.len() + UHS)
-                    .map_err(IpStackError::from)?;
+                ip_h.set_payload_len(payload.len() + UHS)?;
                 let udp_header = UdpHeader::with_ipv4_checksum(
                     self.dst_addr.port(),
                     self.src_addr.port(),
                     &ip_h,
                     &payload,
-                )
-                .map_err(IpStackError::from)?;
+                )?;
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
@@ -94,8 +89,7 @@ impl IpStackUdpStream {
                     self.src_addr.port(),
                     &ip_h,
                     &payload,
-                )
-                .map_err(IpStackError::from)?;
+                )?;
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
@@ -115,8 +109,8 @@ impl IpStackUdpStream {
     }
 
     fn reset_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.udp_timeout;
-        self.timeout.as_mut().reset(deadline);
+        let deadline = std::time::Instant::now() + self.udp_timeout;
+        self.timeout.as_mut().set_at(deadline);
     }
 }
 
@@ -124,11 +118,11 @@ impl AsyncRead for IpStackUdpStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        mut buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         if let Some(p) = self.first_payload.take() {
             buf.put_slice(&p);
-            return std::task::Poll::Ready(Ok(()));
+            return std::task::Poll::Ready(Ok(p.len()));
         }
         if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
             return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
@@ -136,12 +130,12 @@ impl AsyncRead for IpStackUdpStream {
 
         self.reset_timeout();
 
-        match self.stream_receiver.poll_recv(cx) {
+        match self.stream_receiver.poll_next(cx) {
             std::task::Poll::Ready(Some(p)) => {
                 buf.put_slice(&p.payload);
-                std::task::Poll::Ready(Ok(()))
+                std::task::Poll::Ready(Ok(p.payload.len()))
             }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(0)),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -154,10 +148,12 @@ impl AsyncWrite for IpStackUdpStream {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         self.reset_timeout();
-        let packet = self.create_rev_packet(TTL, buf.to_vec())?;
+        let packet = self
+            .create_rev_packet(TTL, buf.to_vec())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let payload_len = packet.payload.len();
         self.pkt_sender
-            .send(packet)
+            .try_send(packet)
             .or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))
     }
@@ -169,7 +165,7 @@ impl AsyncWrite for IpStackUdpStream {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
+    fn poll_close(
         self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
