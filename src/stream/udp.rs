@@ -2,11 +2,13 @@ use crate::{
     packet::{IpHeader, NetworkPacket, TransportHeader},
     PacketReceiver, PacketSender, TTL,
 };
-use async_io::Timer;
-use bytes::BufMut as _;
+use anyhow::Context;
+
+use bytes::Bytes;
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
-use futures_lite::{AsyncRead, AsyncWrite, StreamExt};
-use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+
+use smol_timeout::TimeoutExt;
+use std::{net::SocketAddr, pin::Pin, time::Duration};
 
 #[derive(Debug)]
 pub struct IpStackUdpStream {
@@ -15,8 +17,7 @@ pub struct IpStackUdpStream {
     stream_sender: PacketSender,
     stream_receiver: Pin<Box<PacketReceiver>>,
     pkt_sender: PacketSender,
-    first_payload: Option<Vec<u8>>,
-    timeout: Pin<Box<Timer>>,
+
     udp_timeout: Duration,
     mtu: u16,
 }
@@ -25,24 +26,42 @@ impl IpStackUdpStream {
     pub fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
-        payload: Vec<u8>,
+
         pkt_sender: PacketSender,
         mtu: u16,
         udp_timeout: Duration,
     ) -> Self {
         let (stream_sender, stream_receiver) = async_channel::unbounded::<NetworkPacket>();
-        let deadline = std::time::Instant::now() + udp_timeout;
+
         IpStackUdpStream {
             src_addr,
             dst_addr,
             stream_sender,
             stream_receiver: Box::pin(stream_receiver),
             pkt_sender,
-            first_payload: Some(payload),
-            timeout: Box::pin(Timer::at(deadline)),
+
             udp_timeout,
             mtu,
         }
+    }
+
+    pub async fn recv(&self) -> anyhow::Result<Bytes> {
+        Ok(self
+            .stream_receiver
+            .recv()
+            .timeout(self.udp_timeout)
+            .await
+            .context("timeout")??
+            .payload
+            .into())
+    }
+
+    pub async fn send(&self, bts: &[u8]) -> anyhow::Result<()> {
+        let packet = self
+            .create_rev_packet(TTL, bts.to_vec())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.pkt_sender.send(packet).await?;
+        Ok(())
     }
 
     pub(crate) fn stream_sender(&self) -> PacketSender {
@@ -106,69 +125,5 @@ impl IpStackUdpStream {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
-    }
-
-    fn reset_timeout(&mut self) {
-        let deadline = std::time::Instant::now() + self.udp_timeout;
-        self.timeout.as_mut().set_at(deadline);
-    }
-}
-
-impl AsyncRead for IpStackUdpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        mut buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        if let Some(p) = self.first_payload.take() {
-            buf.put_slice(&p);
-            return std::task::Poll::Ready(Ok(p.len()));
-        }
-        if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
-            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-        }
-
-        self.reset_timeout();
-
-        match self.stream_receiver.poll_next(cx) {
-            std::task::Poll::Ready(Some(p)) => {
-                buf.put_slice(&p.payload);
-                std::task::Poll::Ready(Ok(p.payload.len()))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(0)),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for IpStackUdpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        self.reset_timeout();
-        let packet = self
-            .create_rev_packet(TTL, buf.to_vec())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let payload_len = packet.payload.len();
-        self.pkt_sender
-            .try_send(packet)
-            .or(Err(std::io::ErrorKind::UnexpectedEof))?;
-        std::task::Poll::Ready(Ok(payload_len))
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
     }
 }

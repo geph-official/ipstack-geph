@@ -1,11 +1,7 @@
 use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-
 use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
-use crate::{
-    packet::{TcpHeaderWrapper},
-    PacketSender,
-};
+use crate::{packet::TcpHeaderWrapper, PacketSender};
 use std::{net::SocketAddr, pin::Pin, time::Duration};
 
 pub struct IpStackTcpStream {
@@ -108,7 +104,7 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
             std::thread::spawn(move || async move {
-                Box::pin(inner.close()).await;
+                let _ = Box::pin(inner.close()).await;
             });
         }
     }

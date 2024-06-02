@@ -6,7 +6,7 @@ use crate::{
     stream::tcb::{PacketStatus, Tcb, TcpState},
     PacketReceiver, PacketSender, DROP_TTL, TTL,
 };
-use bytes::BufMut as _;
+
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
 use futures_lite::{AsyncRead, AsyncWrite, StreamExt};
 use log::{error, trace, warn};
@@ -178,7 +178,7 @@ impl AsyncRead for IpStackTcpStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
-        mut buf: &mut [u8],
+        buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         loop {
             if let Some(packet) = self.packet_to_send.take() {
@@ -234,14 +234,16 @@ impl AsyncRead for IpStackTcpStream {
                 .filter(|_| matches!(self.shutdown, Shutdown::None))
             {
                 self.tcb.add_ack(b.len() as u32);
-                buf.put_slice(&b);
+                let n = b.len().min(buf.len());
+                buf[..n].copy_from_slice(&b[..n]);
+
                 self.packet_sender
                     .try_send(
                         self.create_rev_packet(ACK, TTL, None, Vec::new())
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
                     )
                     .or(Err(ErrorKind::UnexpectedEof))?;
-                return Poll::Ready(Ok(b.len()));
+                return Poll::Ready(Ok(n));
             }
             if *self.tcb.get_state() == TcpState::FinWait1(true) {
                 self.packet_to_send = Some(
@@ -425,6 +427,10 @@ impl AsyncWrite for IpStackTcpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if *self.tcb.get_state() != TcpState::Established {
+            if matches!(self.tcb.get_state(), &TcpState::SynReceived(_)) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
         }
         self.tcb.reset_timeout();

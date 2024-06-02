@@ -174,11 +174,11 @@ fn create_stream(
             let stream = IpStackUdpStream::new(
                 packet.src_addr(),
                 packet.dst_addr(),
-                packet.payload,
                 pkt_sender,
                 config.mtu,
                 config.udp_timeout,
             );
+            let _ = stream.stream_sender().try_send(packet.clone());
             Some((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
         IpStackPacketProtocol::Unknown => {
