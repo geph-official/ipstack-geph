@@ -37,8 +37,8 @@ impl Default for IpStackConfig {
         IpStackConfig {
             mtu: u16::MAX,
 
-            tcp_timeout: Duration::from_secs(60),
-            udp_timeout: Duration::from_secs(30),
+            tcp_timeout: Duration::from_secs(3600),
+            udp_timeout: Duration::from_secs(600),
         }
     }
 }
