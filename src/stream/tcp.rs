@@ -76,13 +76,14 @@ impl IpStackTcpStream {
         if tcp.inner().syn {
             return Ok(stream);
         }
-        if !tcp.inner().rst {
-            let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
-            if let Err(err) = stream.packet_sender.try_send(pkt) {
-                warn!("Error sending RST/ACK packet: {:?}", err);
-            }
+        let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
+        if let Err(err) = stream.packet_sender.try_send(pkt) {
+            warn!("Error sending RST/ACK packet: {:?}", err);
         }
-        anyhow::bail!("invalid TCP packet")
+        anyhow::bail!(
+            "stray TCP packet src_addr={src_addr} dst_addr={dst_addr}, tcp={:?}",
+            tcp
+        )
     }
 
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
