@@ -164,7 +164,7 @@ fn create_stream(
             ) {
                 Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
-                    error!("IpStackTcpStream::new failed \"{}\"", e);
+                    log::debug!("IpStackTcpStream::new failed \"{}\"", e);
 
                     None
                 }
