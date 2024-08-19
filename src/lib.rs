@@ -35,7 +35,7 @@ pub struct IpStackConfig {
 impl Default for IpStackConfig {
     fn default() -> Self {
         IpStackConfig {
-            mtu: u16::MAX,
+            mtu: 16384,
 
             tcp_timeout: Duration::from_secs(3600),
             udp_timeout: Duration::from_secs(600),
