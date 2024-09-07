@@ -2,7 +2,7 @@
 authors = ['Narrowlink <opensource@narrowlink.com>', 'Nullchinchilla <nullchinchilla@pm.me>']
 description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for transparent proxies'
 name = "ipstack-geph"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/geph-official/ipstack'
