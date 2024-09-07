@@ -103,9 +103,14 @@ impl AsyncWrite for IpStackTcpStream {
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
-            std::thread::spawn(move || async move {
-                let _ = Box::pin(inner.close()).await;
-            });
+            std::thread::Builder::new()
+                .stack_size(10000)
+                .spawn(move || {
+                    futures_lite::future::block_on(async move {
+                        let _ = Box::pin(inner.close()).await;
+                    })
+                })
+                .unwrap();
         }
     }
 }
