@@ -29,6 +29,7 @@ async-io = "2.3.2"
 pollster = "0.3.0"
 smol-timeout = "0.6.0"
 moka = {version="0.12.8", features=["sync"]}
+smolscale = "0.4.11"
 
 [dev-dependencies]
 criterion="0.5"
