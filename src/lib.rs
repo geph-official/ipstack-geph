@@ -7,16 +7,14 @@ use async_channel::{Receiver, Sender};
 use async_executor::Executor;
 use bytes::Bytes;
 use log::{error, trace};
+use moka::sync::Cache;
 use packet::{NetworkPacket, NetworkTuple};
 use parking_lot::Mutex;
-use std::{
-    collections::hash_map::Entry::{Occupied, Vacant},
-    time::Duration,
-};
+use std::time::Duration;
 
 pub(crate) type PacketSender = Sender<NetworkPacket>;
 pub(crate) type PacketReceiver = Receiver<NetworkPacket>;
-pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
+pub(crate) type SessionCollection = Cache<NetworkTuple, PacketSender>;
 
 mod packet;
 pub mod stream;
@@ -78,7 +76,9 @@ async fn run(
     send_packet: Sender<Bytes>,
     accept_sender: Sender<IpStackStream>,
 ) -> anyhow::Result<()> {
-    let sessions: SessionCollection = AHashMap::new();
+    let sessions: SessionCollection = Cache::builder()
+        .time_to_idle(Duration::from_secs(600))
+        .build();
     let sessions = Mutex::new(sessions);
 
     let (pkt_sender, pkt_receiver) = async_channel::unbounded::<NetworkPacket>();
@@ -129,21 +129,13 @@ fn process_device_read(
         ));
     }
 
-    match sessions.entry(packet.network_tuple()) {
-        Occupied(mut entry) => {
-            if let Err(async_channel::TrySendError::Full(e)) = entry.get().try_send(packet) {
-                create_stream(e, config, pkt_sender).map(|s| {
-                    entry.insert(s.0);
-                    s.1
-                })
-            } else {
-                None
-            }
-        }
-        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|s| {
-            entry.insert(s.0);
-            s.1
-        }),
+    if let Some(sender) = sessions.get(&packet.network_tuple()) {
+        let _ = sender.try_send(packet);
+        None
+    } else {
+        let (a, b) = create_stream(packet.clone(), config, pkt_sender)?;
+        sessions.insert(packet.network_tuple(), a);
+        Some(b)
     }
 }
 

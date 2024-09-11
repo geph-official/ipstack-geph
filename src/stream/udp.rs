@@ -31,7 +31,7 @@ impl IpStackUdpStream {
         mtu: u16,
         udp_timeout: Duration,
     ) -> Self {
-        let (stream_sender, stream_receiver) = async_channel::unbounded::<NetworkPacket>();
+        let (stream_sender, stream_receiver) = async_channel::bounded::<NetworkPacket>(10);
 
         IpStackUdpStream {
             src_addr,
