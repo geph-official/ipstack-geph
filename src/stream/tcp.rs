@@ -76,9 +76,13 @@ impl IpStackTcpStream {
         if tcp.inner().syn {
             return Ok(stream);
         }
-        let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
-        if let Err(err) = stream.packet_sender.try_send(pkt) {
-            warn!("Error sending RST/ACK packet: {:?}", err);
+        if tcp.inner().rst {
+            warn!("not responding RST with RST")
+        } else {
+            let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
+            if let Err(err) = stream.packet_sender.try_send(pkt) {
+                warn!("Error sending RST/ACK packet: {:?}", err);
+            }
         }
         anyhow::bail!(
             "stray TCP packet src_addr={src_addr} dst_addr={dst_addr}, tcp={:?}",
