@@ -186,6 +186,24 @@ impl AsyncRead for IpStackTcpStream {
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         loop {
+            // Check for RTO expiration and retransmit the oldest
+            // unacknowledged packet if necessary.
+            let poll_rto = !self.tcb.inflight_packets.is_empty();
+            if poll_rto {
+                if self.tcb.poll_rto(cx) {
+                    let pkt = self.tcb.inflight_packets.first().unwrap();
+                    // Retransmit the packet exactly as it was sent.
+                    if let Ok(rp) =
+                        self.create_rev_packet(PSH | ACK, TTL, pkt.seq, pkt.payload.clone())
+                    {
+                        tracing::warn!(
+                            "retransmitting {}; this is unusual unless buffers are full",
+                            pkt.seq
+                        );
+                        let _ = self.packet_sender.try_send(rp);
+                    }
+                }
+            }
             if let Some(packet) = self.packet_to_send.take() {
                 self.packet_sender
                     .try_send(packet)

@@ -3,6 +3,7 @@ use async_io::Timer;
 use crate::packet::TcpHeaderWrapper;
 use std::{
     collections::BTreeMap,
+    future::Future,
     pin::Pin,
     time::{Duration, Instant},
 };
@@ -43,6 +44,14 @@ pub(super) struct Tcb {
     avg_send_window: (u64, u64), // (avg, count)
     pub(super) inflight_packets: Vec<InflightPacket>,
     unordered_packets: BTreeMap<u32, UnorderedPacket>,
+
+    // Very simple RTO (Retransmission TimeOut) timer. Whenever there is at
+    // at least one un-acknowledged packet in `inflight_packets` we arm this
+    // timer for a fixed 100 ms. When the timer fires the oldest un-
+    // acknowledged packet should be retransmitted and the timer re-armed if
+    // there are still packets in flight. This is an extremely rudimentary
+    // implementation that does not try to follow RFC 6298.
+    rto_timer: Pin<Box<Timer>>,
 }
 
 impl Tcb {
@@ -65,6 +74,10 @@ impl Tcb {
             avg_send_window: (1, 1),
             inflight_packets: Vec::new(),
             unordered_packets: BTreeMap::new(),
+
+            // RTO timer starts disabled – it will be armed when the first
+            // packet is placed into the inflight buffer.
+            rto_timer: Box::pin(Timer::interval(Duration::from_millis(100))),
         }
     }
     pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
@@ -183,6 +196,7 @@ impl Tcb {
         if self.state == TcpState::Established {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
                 let mut inflight_packet = self.inflight_packets.remove(i);
+                tracing::warn!("packet {} is acked", inflight_packet.seq);
                 let distance = ack.wrapping_sub(inflight_packet.seq) as usize;
                 if distance < inflight_packet.payload.len() {
                     inflight_packet.payload.drain(0..distance);
@@ -198,6 +212,16 @@ impl Tcb {
     }
     pub fn is_send_buffer_full(&self) -> bool {
         self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
+    }
+
+    //==================== RTO helpers ====================
+
+    // Poll the RTO timer. Returns true if it has fired.
+    pub(crate) fn poll_rto(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        match Pin::new(&mut self.rto_timer).poll(cx) {
+            std::task::Poll::Ready(_) => true,
+            std::task::Poll::Pending => false,
+        }
     }
 
     pub(crate) fn reset_timeout(&mut self) {
