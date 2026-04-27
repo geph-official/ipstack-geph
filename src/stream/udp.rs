@@ -68,13 +68,18 @@ impl IpStackUdpStream {
         self.stream_sender.clone()
     }
 
-    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> anyhow::Result<NetworkPacket> {
+    fn create_rev_packet(&self, ttl: u8, payload: Vec<u8>) -> anyhow::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
                 let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets())?;
+                if self.mtu < (ip_h.header_len() + UHS) as u16 {
+                    anyhow::bail!("message too large");
+                }
                 let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
-                payload.truncate(line_buffer as usize);
+                if payload.len() > line_buffer as usize {
+                    anyhow::bail!("message too large");
+                }
                 ip_h.set_payload_len(payload.len() + UHS)?;
                 let udp_header = UdpHeader::with_ipv4_checksum(
                     self.dst_addr.port(),
@@ -98,9 +103,14 @@ impl IpStackUdpStream {
                     source: dst.octets(),
                     destination: src.octets(),
                 };
+                if self.mtu < (ip_h.header_len() + UHS) as u16 {
+                    anyhow::bail!("message too large");
+                }
                 let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
 
-                payload.truncate(line_buffer as usize);
+                if payload.len() > line_buffer as usize {
+                    anyhow::bail!("message too large");
+                }
 
                 ip_h.payload_length = (payload.len() + UHS) as u16;
                 let udp_header = UdpHeader::with_ipv6_checksum(
@@ -125,5 +135,44 @@ impl IpStackUdpStream {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
+
+    #[test]
+    fn oversized_udp_datagram_returns_error() {
+        let (sender, _receiver) = async_channel::unbounded();
+        let stream = IpStackUdpStream::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000),
+            sender,
+            28,
+            Duration::from_secs(60),
+        );
+
+        assert!(stream.create_rev_packet(TTL, vec![1]).is_err());
+        assert!(stream.create_rev_packet(TTL, Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn oversized_ipv6_udp_datagram_returns_error() {
+        let (sender, _receiver) = async_channel::unbounded();
+        let stream = IpStackUdpStream::new(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1000),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 2000),
+            sender,
+            48,
+            Duration::from_secs(60),
+        );
+
+        assert!(stream.create_rev_packet(TTL, vec![1]).is_err());
+        assert!(stream.create_rev_packet(TTL, Vec::new()).is_ok());
     }
 }

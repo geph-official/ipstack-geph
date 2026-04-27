@@ -9,7 +9,9 @@ use std::{
 };
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
+const MAX_INFLIGHT_SEGMENTS: usize = 16;
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+const RTO: Duration = Duration::from_millis(100);
 
 #[derive(Debug, PartialEq)]
 pub enum TcpState {
@@ -75,18 +77,20 @@ impl Tcb {
             inflight_packets: Vec::new(),
             unordered_packets: BTreeMap::new(),
 
-            // RTO timer starts disabled – it will be armed when the first
-            // packet is placed into the inflight buffer.
-            rto_timer: Box::pin(Timer::interval(Duration::from_millis(100))),
+            rto_timer: Box::pin(Timer::never()),
         }
     }
     pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
+        let was_empty = self.inflight_packets.is_empty();
         let buf_len = buf.len() as u32;
         self.inflight_packets.push(InflightPacket::new(seq, buf));
         self.seq = self.seq.wrapping_add(buf_len);
+        if was_empty && buf_len > 0 {
+            self.arm_rto();
+        }
     }
     pub(super) fn add_unordered_packet(&mut self, seq: u32, buf: Vec<u8>) {
-        if seq < self.ack {
+        if seq_before(seq, self.ack) {
             return;
         }
         self.unordered_packets
@@ -161,15 +165,11 @@ impl Tcb {
 
     pub(super) fn check_pkt_type(&self, header: &TcpHeaderWrapper, p: &[u8]) -> PacketStatus {
         let tcp_header = header.inner();
-        let received_ack_distance = self.seq.wrapping_sub(tcp_header.acknowledgment_number);
+        let packet_ack = tcp_header.acknowledgment_number;
 
-        let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
-        if received_ack_distance > current_ack_distance
-            || (tcp_header.acknowledgment_number != self.seq
-                && self.seq.saturating_sub(tcp_header.acknowledgment_number) == 0)
-        {
+        if seq_before(packet_ack, self.last_ack) || seq_after(packet_ack, self.seq) {
             PacketStatus::Invalid
-        } else if self.last_ack == tcp_header.acknowledgment_number {
+        } else if self.last_ack == packet_ack {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else if self.send_window == tcp_header.window_size && self.seq != self.last_ack {
@@ -179,7 +179,7 @@ impl Tcb {
             } else {
                 PacketStatus::WindowUpdate
             }
-        } else if self.last_ack < tcp_header.acknowledgment_number {
+        } else if seq_after(packet_ack, self.last_ack) {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else {
@@ -190,8 +190,10 @@ impl Tcb {
         }
     }
     pub(super) fn change_last_ack(&mut self, ack: u32) {
-        let distance = ack.wrapping_sub(self.last_ack);
-        self.last_ack = self.last_ack.wrapping_add(distance);
+        if seq_before(ack, self.last_ack) || seq_after(ack, self.seq) {
+            return;
+        }
+        self.last_ack = ack;
 
         if self.state == TcpState::Established {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
@@ -206,27 +208,47 @@ impl Tcb {
             }
             self.inflight_packets.retain(|p| {
                 let last_byte = p.seq.wrapping_add(p.payload.len() as u32);
-                last_byte.saturating_sub(self.last_ack) > 0
+                seq_after(last_byte, self.last_ack)
             });
+            if self.inflight_packets.is_empty() {
+                self.disarm_rto();
+            } else {
+                self.arm_rto();
+            }
         }
     }
     pub fn is_send_buffer_full(&self) -> bool {
-        self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
+        self.inflight_packets.len() >= MAX_INFLIGHT_SEGMENTS
+            || self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
     }
 
     //==================== RTO helpers ====================
 
     // Poll the RTO timer. Returns true if it has fired.
     pub(crate) fn poll_rto(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        match Pin::new(&mut self.rto_timer).poll(cx) {
-            std::task::Poll::Ready(_) => true,
-            std::task::Poll::Pending => false,
+        if Pin::new(&mut self.rto_timer).poll(cx).is_ready() {
+            if self.inflight_packets.is_empty() {
+                self.disarm_rto();
+            } else {
+                self.arm_rto();
+            }
+            true
+        } else {
+            false
         }
     }
 
     pub(crate) fn reset_timeout(&mut self) {
         let deadline = Instant::now() + self.tcp_timeout;
         self.timeout.as_mut().set_at(deadline);
+    }
+
+    fn arm_rto(&mut self) {
+        self.rto_timer.as_mut().set_after(RTO);
+    }
+
+    fn disarm_rto(&mut self) {
+        self.rto_timer.as_mut().set_after(Duration::MAX);
     }
 }
 
@@ -246,7 +268,7 @@ impl InflightPacket {
         }
     }
     pub(crate) fn contains(&self, seq: u32) -> bool {
-        self.seq < seq && seq <= self.seq + self.payload.len() as u32
+        seq_after(seq, self.seq) && seq_lte(seq, self.seq.wrapping_add(self.payload.len() as u32))
     }
 }
 
@@ -262,5 +284,46 @@ impl UnorderedPacket {
             payload,
             // recv_time: SystemTime::now(), // todo
         }
+    }
+}
+
+fn seq_before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+fn seq_after(a: u32, b: u32) -> bool {
+    seq_before(b, a)
+}
+
+fn seq_lte(a: u32, b: u32) -> bool {
+    a == b || seq_before(a, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_comparisons_wrap() {
+        assert!(seq_after(2, u32::MAX - 2));
+        assert!(seq_before(u32::MAX - 2, 2));
+        assert!(seq_lte(2, 2));
+    }
+
+    #[test]
+    fn partial_ack_across_wrap_keeps_remaining_payload() {
+        let mut tcb = Tcb::new(0, Duration::from_secs(60));
+        tcb.change_state(TcpState::Established);
+        tcb.seq = u32::MAX - 2;
+        tcb.last_ack = u32::MAX - 2;
+
+        tcb.add_inflight_packet(u32::MAX - 2, vec![0; 10]);
+        assert_eq!(tcb.seq, 7);
+
+        tcb.change_last_ack(2);
+        assert_eq!(tcb.last_ack, 2);
+        assert_eq!(tcb.inflight_packets.len(), 1);
+        assert_eq!(tcb.inflight_packets[0].seq, 2);
+        assert_eq!(tcb.inflight_packets[0].payload.len(), 5);
     }
 }

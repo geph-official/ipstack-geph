@@ -189,19 +189,15 @@ impl AsyncRead for IpStackTcpStream {
             // Check for RTO expiration and retransmit the oldest
             // unacknowledged packet if necessary.
             let poll_rto = !self.tcb.inflight_packets.is_empty();
-            if poll_rto {
-                if self.tcb.poll_rto(cx) {
-                    let pkt = self.tcb.inflight_packets.first().unwrap();
-                    // Retransmit the packet exactly as it was sent.
-                    if let Ok(rp) =
-                        self.create_rev_packet(PSH | ACK, TTL, pkt.seq, pkt.payload.clone())
-                    {
-                        tracing::warn!(
-                            "retransmitting {}; this is unusual unless buffers are full",
-                            pkt.seq
-                        );
-                        let _ = self.packet_sender.try_send(rp);
-                    }
+            if poll_rto && self.tcb.poll_rto(cx) {
+                let pkt = self.tcb.inflight_packets.first().unwrap();
+                if let Ok(rp) = self.create_rev_packet(PSH | ACK, TTL, pkt.seq, pkt.payload.clone())
+                {
+                    tracing::warn!(
+                        "retransmitting {}; this is unusual unless buffers are full",
+                        pkt.seq
+                    );
+                    let _ = self.packet_sender.try_send(rp);
                 }
             }
             if let Some(packet) = self.packet_to_send.take() {
@@ -227,20 +223,6 @@ impl AsyncRead for IpStackTcpStream {
             let min = self.tcb.get_available_read_buffer_size() as u16;
             self.tcb.change_recv_window(min);
 
-            if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
-                trace!("timeout reached for {:?}", self.dst_addr);
-                self.packet_sender
-                    .try_send(
-                        self.create_rev_packet(RST | ACK, TTL, None, Vec::new())
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
-                    )
-                    .or(Err(ErrorKind::UnexpectedEof))?;
-                self.tcb.change_state(TcpState::Closed);
-                self.shutdown.ready();
-                return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
-            }
-            self.tcb.reset_timeout();
-
             if *self.tcb.get_state() == TcpState::SynReceived(false) {
                 self.packet_to_send = Some(
                     self.create_rev_packet(SYN | ACK, TTL, None, Vec::new())
@@ -256,9 +238,15 @@ impl AsyncRead for IpStackTcpStream {
                 .get_unordered_packets()
                 .filter(|_| matches!(self.shutdown, Shutdown::None))
             {
-                self.tcb.add_ack(b.len() as u32);
+                let mut b = b;
                 let n = b.len().min(buf.len());
                 buf[..n].copy_from_slice(&b[..n]);
+                self.tcb.add_ack(n as u32);
+                if n < b.len() {
+                    let remaining = b.split_off(n);
+                    let next_seq = self.tcb.get_ack();
+                    self.tcb.add_unordered_packet(next_seq, remaining);
+                }
 
                 self.packet_sender
                     .try_send(
@@ -267,6 +255,18 @@ impl AsyncRead for IpStackTcpStream {
                     )
                     .or(Err(ErrorKind::UnexpectedEof))?;
                 return Poll::Ready(Ok(n));
+            }
+            if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
+                trace!("timeout reached for {:?}", self.dst_addr);
+                self.packet_sender
+                    .try_send(
+                        self.create_rev_packet(RST | ACK, TTL, None, Vec::new())
+                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
+                    )
+                    .or(Err(ErrorKind::UnexpectedEof))?;
+                self.tcb.change_state(TcpState::Closed);
+                self.shutdown.ready();
+                return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
             if *self.tcb.get_state() == TcpState::FinWait1(true) {
                 self.packet_to_send = Some(
@@ -291,6 +291,7 @@ impl AsyncRead for IpStackTcpStream {
             }
             match self.stream_receiver.poll_next(cx) {
                 Poll::Ready(Some(p)) => {
+                    self.tcb.reset_timeout();
                     let IpStackPacketProtocol::Tcp(t) = p.transport_protocol() else {
                         unreachable!()
                     };
@@ -456,9 +457,13 @@ impl AsyncWrite for IpStackTcpStream {
             }
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
         }
-        self.tcb.reset_timeout();
 
-        if (self.tcb.get_send_window() as u64) < self.tcb.get_avg_send_window() / 2
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        if self.tcb.get_send_window() == 0
+            || (self.tcb.get_send_window() as u64) < self.tcb.get_avg_send_window() / 2
             || self.tcb.is_send_buffer_full()
         {
             self.write_notify = Some(cx.waker().clone());
@@ -477,11 +482,16 @@ impl AsyncWrite for IpStackTcpStream {
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
         let seq = self.tcb.get_seq();
         let payload_len = packet.payload.len();
+        if payload_len == 0 {
+            self.write_notify = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
         let payload = packet.payload.clone();
         self.packet_sender
             .try_send(packet)
             .or(Err(ErrorKind::UnexpectedEof))?;
         self.tcb.add_inflight_packet(seq, payload);
+        self.tcb.reset_timeout();
 
         Poll::Ready(Ok(payload_len))
     }
@@ -513,7 +523,10 @@ impl AsyncWrite for IpStackTcpStream {
                     error!("seq: {}", p.seq);
                     error!("payload len: {}", p.payload.len());
                 }
-                panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::ConnectionReset,
+                    "requested retransmission is no longer in flight",
+                )));
             }
         }
         Poll::Ready(Ok(()))
@@ -539,5 +552,47 @@ impl Drop for IpStackTcpStream {
                 trace!("Error sending NON packet: {:?}", err);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        future::poll_fn,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
+
+    #[test]
+    fn partial_reads_keep_remaining_payload() {
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let (_stream_sender, stream_receiver) = async_channel::unbounded();
+        let mut tcb = Tcb::new(1000, Duration::from_secs(60));
+        tcb.change_state(TcpState::Established);
+        tcb.add_unordered_packet(1000, vec![1, 2, 3, 4, 5]);
+
+        let mut stream = Box::pin(IpStackTcpStream {
+            src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000),
+            dst_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000),
+            stream_receiver: Box::pin(stream_receiver),
+            packet_sender,
+            packet_to_send: None,
+            tcb,
+            mtu: 1500,
+            shutdown: Shutdown::None,
+            write_notify: None,
+        });
+
+        let mut first = [0; 2];
+        let n =
+            pollster::block_on(poll_fn(|cx| stream.as_mut().poll_read(cx, &mut first))).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(first, [1, 2]);
+
+        let mut second = [0; 8];
+        let n =
+            pollster::block_on(poll_fn(|cx| stream.as_mut().poll_read(cx, &mut second))).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&second[..3], &[3, 4, 5]);
     }
 }
