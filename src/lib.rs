@@ -3,7 +3,6 @@ use crate::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
 use async_channel::{Receiver, Sender};
-use async_executor::Executor;
 use bytes::Bytes;
 use log::trace;
 use moka::{sync::Cache, Expiry};
@@ -42,30 +41,34 @@ impl Default for IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: Receiver<IpStackStream>,
-    exec: Executor<'static>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl IpStack {
+    /// Creates a new `IpStack`. Must be called from within a tokio runtime, as
+    /// the background processing loop is spawned onto it.
     pub fn new(
         config: IpStackConfig,
         recv_packet: Receiver<Bytes>,
         send_packet: Sender<Bytes>,
     ) -> IpStack {
         let (accept_sender, accept_receiver) = async_channel::unbounded();
-        let exec = Executor::new();
-        exec.spawn(run(config, recv_packet, send_packet, accept_sender))
-            .detach();
+        let task = tokio::spawn(run(config, recv_packet, send_packet, accept_sender));
 
         IpStack {
             accept_receiver,
-            exec,
+            task,
         }
     }
 
     pub async fn accept(&self) -> anyhow::Result<IpStackStream> {
-        self.exec
-            .run(async { Ok(self.accept_receiver.recv().await?) })
-            .await
+        Ok(self.accept_receiver.recv().await?)
+    }
+}
+
+impl Drop for IpStack {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -252,11 +255,17 @@ mod tests {
     use super::*;
     use crate::packet::{tcp_flags, IpHeader, TransportHeader};
     use etherparse::{IpNumber, Ipv4Header, TcpHeader};
-    use futures_lite::{
-        future::{poll_fn, poll_once},
-        AsyncRead, AsyncWrite,
-    };
+    use futures_lite::future::poll_once;
+    use std::future::poll_fn;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    fn current_thread_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
 
     fn udp_packet(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
         let builder =
@@ -358,8 +367,9 @@ mod tests {
         let second = udp_packet(1000, 2000, b"two");
         assert!(process_device_read(&second, &mut sessions, packet_sender, &config).is_none());
 
-        assert_eq!(&*pollster::block_on(stream.recv()).unwrap(), b"one");
-        assert_eq!(&*pollster::block_on(stream.recv()).unwrap(), b"two");
+        let rt = current_thread_rt();
+        assert_eq!(&*rt.block_on(stream.recv()).unwrap(), b"one");
+        assert_eq!(&*rt.block_on(stream.recv()).unwrap(), b"two");
     }
 
     #[test]
@@ -390,8 +400,8 @@ mod tests {
         assert!(sessions.get(&removed_tuple).is_none());
     }
 
-    #[test]
-    fn tcp_happy_path_handshake_write_ack_and_read_payload() {
+    #[tokio::test]
+    async fn tcp_happy_path_handshake_write_ack_and_read_payload() {
         let config = IpStackConfig {
             mtu: 1500,
             tcp_timeout: Duration::from_secs(60),
@@ -414,9 +424,11 @@ mod tests {
         let mut stream = Box::pin(stream);
 
         let mut empty = [];
-        let first_read = pollster::block_on(poll_once(poll_fn(|cx| {
-            stream.as_mut().poll_read(cx, &mut empty)
-        })));
+        let first_read = poll_once(poll_fn(|cx| {
+            let mut rb = ReadBuf::new(&mut empty);
+            stream.as_mut().poll_read(cx, &mut rb)
+        }))
+        .await;
         assert!(first_read.is_none());
 
         let syn_ack = packet_receiver.try_recv().unwrap();
@@ -438,14 +450,16 @@ mod tests {
             process_device_read(&client_ack, &mut sessions, packet_sender.clone(), &config)
                 .is_none()
         );
-        let establish = pollster::block_on(poll_once(poll_fn(|cx| {
-            stream.as_mut().poll_read(cx, &mut empty)
-        })));
+        let establish = poll_once(poll_fn(|cx| {
+            let mut rb = ReadBuf::new(&mut empty);
+            stream.as_mut().poll_read(cx, &mut rb)
+        }))
+        .await;
         assert!(establish.is_none());
 
-        let written =
-            pollster::block_on(poll_fn(|cx| stream.as_mut().poll_write(cx, b"server-data")))
-                .unwrap();
+        let written = poll_fn(|cx| stream.as_mut().poll_write(cx, b"server-data"))
+            .await
+            .unwrap();
         assert_eq!(written, b"server-data".len());
 
         let outbound = packet_receiver.try_recv().unwrap();
@@ -464,9 +478,11 @@ mod tests {
             &config
         )
         .is_none());
-        let ack_poll = pollster::block_on(poll_once(poll_fn(|cx| {
-            stream.as_mut().poll_read(cx, &mut empty)
-        })));
+        let ack_poll = poll_once(poll_fn(|cx| {
+            let mut rb = ReadBuf::new(&mut empty);
+            stream.as_mut().poll_read(cx, &mut rb)
+        }))
+        .await;
         assert!(ack_poll.is_none());
 
         let inbound = tcp_packet(
@@ -480,8 +496,16 @@ mod tests {
         assert!(process_device_read(&inbound, &mut sessions, packet_sender, &config).is_none());
 
         let mut read_buf = [0; 32];
-        let read =
-            pollster::block_on(poll_fn(|cx| stream.as_mut().poll_read(cx, &mut read_buf))).unwrap();
+        let read = poll_fn(|cx| {
+            let mut rb = ReadBuf::new(&mut read_buf);
+            match stream.as_mut().poll_read(cx, &mut rb) {
+                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(rb.filled().len())),
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(&read_buf[..read], b"client-data");
 
         let data_ack = packet_receiver.try_recv().unwrap();

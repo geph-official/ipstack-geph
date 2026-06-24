@@ -1,17 +1,20 @@
-use async_io::Timer;
+use tokio::time::{sleep_until, Instant as TokioInstant, Sleep};
 
 use crate::packet::TcpHeaderWrapper;
 use std::{
     collections::BTreeMap,
     future::Future,
     pin::Pin,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const MAX_INFLIGHT_SEGMENTS: usize = 16;
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 const RTO: Duration = Duration::from_millis(100);
+// tokio has no "never" timer, so we use a deadline far enough in the future to
+// stand in for one without overflowing the instant arithmetic.
+const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 
 #[derive(Debug, PartialEq)]
 pub enum TcpState {
@@ -38,7 +41,7 @@ pub(super) struct Tcb {
     pub(super) retransmission: Option<u32>,
     ack: u32,
     last_ack: u32,
-    pub(super) timeout: Pin<Box<Timer>>,
+    pub(super) timeout: Pin<Box<Sleep>>,
     tcp_timeout: Duration,
     recv_window: u16,
     send_window: u16,
@@ -53,7 +56,7 @@ pub(super) struct Tcb {
     // acknowledged packet should be retransmitted and the timer re-armed if
     // there are still packets in flight. This is an extremely rudimentary
     // implementation that does not try to follow RFC 6298.
-    rto_timer: Pin<Box<Timer>>,
+    rto_timer: Pin<Box<Sleep>>,
 }
 
 impl Tcb {
@@ -62,14 +65,14 @@ impl Tcb {
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::random::<u32>();
-        let deadline = Instant::now() + tcp_timeout;
+        let deadline = TokioInstant::now() + tcp_timeout;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
             tcp_timeout,
-            timeout: Box::pin(Timer::at(deadline)),
+            timeout: Box::pin(sleep_until(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::SynReceived(false),
@@ -77,7 +80,7 @@ impl Tcb {
             inflight_packets: Vec::new(),
             unordered_packets: BTreeMap::new(),
 
-            rto_timer: Box::pin(Timer::never()),
+            rto_timer: Box::pin(sleep_until(TokioInstant::now() + FAR_FUTURE)),
         }
     }
     pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
@@ -239,16 +242,20 @@ impl Tcb {
     }
 
     pub(crate) fn reset_timeout(&mut self) {
-        let deadline = Instant::now() + self.tcp_timeout;
-        self.timeout.as_mut().set_at(deadline);
+        let deadline = TokioInstant::now() + self.tcp_timeout;
+        self.timeout.as_mut().reset(deadline);
     }
 
     fn arm_rto(&mut self) {
-        self.rto_timer.as_mut().set_after(RTO);
+        self.rto_timer
+            .as_mut()
+            .reset(TokioInstant::now() + RTO);
     }
 
     fn disarm_rto(&mut self) {
-        self.rto_timer.as_mut().set_after(Duration::MAX);
+        self.rto_timer
+            .as_mut()
+            .reset(TokioInstant::now() + FAR_FUTURE);
     }
 }
 
@@ -310,8 +317,8 @@ mod tests {
         assert!(seq_lte(2, 2));
     }
 
-    #[test]
-    fn partial_ack_across_wrap_keeps_remaining_payload() {
+    #[tokio::test]
+    async fn partial_ack_across_wrap_keeps_remaining_payload() {
         let mut tcb = Tcb::new(0, Duration::from_secs(60));
         tcb.change_state(TcpState::Established);
         tcb.seq = u32::MAX - 2;

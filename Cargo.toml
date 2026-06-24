@@ -22,16 +22,13 @@ rand = { version = "0.8.5", default-features = false, features = [
 anyhow = "1.0.83"
 bytes = "1.6.0"
 async-channel = "2.3.0"
-async-executor = "1.11.0"
 futures-lite = "2.3.0"
 parking_lot = "0.12.2"
-async-io = "2.3.2"
-pollster = "0.3.0"
-smol-timeout = "0.6.0"
 moka = {version="0.12.8", features=["sync"]}
-smolscale = "0.4.11"
 tracing = "0.1.41"
+tokio = { version = "1", features = ["rt", "time", "io-util"] }
 
 [dev-dependencies]
 criterion="0.5"
+tokio = { version = "1", features = ["rt", "time", "io-util", "macros"] }
 

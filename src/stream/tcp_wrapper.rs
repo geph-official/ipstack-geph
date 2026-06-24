@@ -1,4 +1,4 @@
-use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
 use crate::{packet::TcpHeaderWrapper, PacketSender};
@@ -52,10 +52,10 @@ impl AsyncRead for IpStackTcpStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.inner.as_mut() {
-            Some(mut inner) => Pin::new(&mut inner).poll_read(cx, buf),
+            Some(inner) => Pin::new(inner.as_mut()).poll_read(cx, buf),
             None => {
                 std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected)))
             }
@@ -70,7 +70,7 @@ impl AsyncWrite for IpStackTcpStream {
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         match self.inner.as_mut() {
-            Some(mut inner) => Pin::new(&mut inner).poll_write(cx, buf),
+            Some(inner) => Pin::new(inner.as_mut()).poll_write(cx, buf),
             None => {
                 std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected)))
             }
@@ -81,18 +81,18 @@ impl AsyncWrite for IpStackTcpStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.inner.as_mut() {
-            Some(mut inner) => Pin::new(&mut inner).poll_flush(cx),
+            Some(inner) => Pin::new(inner.as_mut()).poll_flush(cx),
             None => {
                 std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected)))
             }
         }
     }
-    fn poll_close(
+    fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.inner.as_mut() {
-            Some(mut inner) => Pin::new(&mut inner).poll_close(cx),
+            Some(inner) => Pin::new(inner.as_mut()).poll_shutdown(cx),
             None => {
                 std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected)))
             }
@@ -102,11 +102,16 @@ impl AsyncWrite for IpStackTcpStream {
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
-        if let Some(mut inner) = self.inner.take() {
-            smolscale::spawn(async move {
-                let _ = Box::pin(inner.close()).await;
-            })
-            .detach()
+        if let Some(inner) = self.inner.take() {
+            // Only attempt the graceful shutdown if we are inside a tokio
+            // runtime; otherwise just drop the stream (its own Drop impl emits
+            // the teardown packet).
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let mut inner = *inner;
+                    let _ = inner.shutdown().await;
+                });
+            }
         }
     }
 }

@@ -8,8 +8,9 @@ use crate::{
 };
 
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
-use futures_lite::{AsyncRead, AsyncWrite, StreamExt};
+use futures_lite::StreamExt;
 use log::{error, trace, warn};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use std::{
     cmp,
     future::Future,
@@ -179,8 +180,8 @@ impl IpStackTcpStream {
     }
 }
 
-impl AsyncRead for IpStackTcpStream {
-    fn poll_read(
+impl IpStackTcpStream {
+    fn poll_read_inner(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
@@ -340,7 +341,7 @@ impl AsyncRead for IpStackTcpStream {
                                 PacketStatus::RetransmissionRequest => {
                                     self.tcb.change_send_window(t.inner().window_size);
                                     self.tcb.retransmission = Some(t.inner().acknowledgment_number);
-                                    if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
+                                    if matches!(self.as_mut().poll_flush_inner(cx), Poll::Pending) {
                                         return Poll::Pending;
                                     }
                                     continue;
@@ -444,8 +445,8 @@ impl AsyncRead for IpStackTcpStream {
     }
 }
 
-impl AsyncWrite for IpStackTcpStream {
-    fn poll_write(
+impl IpStackTcpStream {
+    fn poll_write_inner(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
@@ -472,7 +473,7 @@ impl AsyncWrite for IpStackTcpStream {
 
         if self.tcb.retransmission.is_some() {
             self.write_notify = Some(cx.waker().clone());
-            if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
+            if matches!(self.as_mut().poll_flush_inner(cx), Poll::Pending) {
                 return Poll::Pending;
             }
         }
@@ -496,7 +497,7 @@ impl AsyncWrite for IpStackTcpStream {
         Poll::Ready(Ok(payload_len))
     }
 
-    fn poll_flush(
+    fn poll_flush_inner(
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
@@ -532,7 +533,7 @@ impl AsyncWrite for IpStackTcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(
+    fn poll_close_inner(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
@@ -541,7 +542,49 @@ impl AsyncWrite for IpStackTcpStream {
         } else if matches!(self.shutdown, Shutdown::None) {
             self.shutdown.pending(cx.waker().clone());
         }
-        self.poll_read(cx, &mut []).map(|x| x.map(|_| ()))
+        self.poll_read_inner(cx, &mut []).map(|x| x.map(|_| ()))
+    }
+}
+
+impl AsyncRead for IpStackTcpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let unfilled = buf.initialize_unfilled();
+        match self.poll_read_inner(cx, unfilled) {
+            Poll::Ready(Ok(n)) => {
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for IpStackTcpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_write_inner(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_flush_inner(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_close_inner(cx)
     }
 }
 
@@ -563,8 +606,8 @@ mod tests {
         net::{IpAddr, Ipv4Addr, SocketAddr},
     };
 
-    #[test]
-    fn partial_reads_keep_remaining_payload() {
+    #[tokio::test]
+    async fn partial_reads_keep_remaining_payload() {
         let (packet_sender, _packet_receiver) = async_channel::unbounded();
         let (_stream_sender, stream_receiver) = async_channel::unbounded();
         let mut tcb = Tcb::new(1000, Duration::from_secs(60));
@@ -584,14 +627,16 @@ mod tests {
         });
 
         let mut first = [0; 2];
-        let n =
-            pollster::block_on(poll_fn(|cx| stream.as_mut().poll_read(cx, &mut first))).unwrap();
+        let n = poll_fn(|cx| stream.as_mut().poll_read_inner(cx, &mut first))
+            .await
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!(first, [1, 2]);
 
         let mut second = [0; 8];
-        let n =
-            pollster::block_on(poll_fn(|cx| stream.as_mut().poll_read(cx, &mut second))).unwrap();
+        let n = poll_fn(|cx| stream.as_mut().poll_read_inner(cx, &mut second))
+            .await
+            .unwrap();
         assert_eq!(n, 3);
         assert_eq!(&second[..3], &[3, 4, 5]);
     }

@@ -7,7 +7,6 @@ use anyhow::Context;
 use bytes::Bytes;
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 
-use smol_timeout::TimeoutExt;
 use std::{net::SocketAddr, pin::Pin, time::Duration};
 
 #[derive(Debug)]
@@ -46,14 +45,13 @@ impl IpStackUdpStream {
     }
 
     pub async fn recv(&self) -> anyhow::Result<Bytes> {
-        Ok(self
-            .stream_receiver
-            .recv()
-            .timeout(self.udp_timeout)
-            .await
-            .context("timeout")??
-            .payload
-            .into())
+        Ok(
+            tokio::time::timeout(self.udp_timeout, self.stream_receiver.recv())
+                .await
+                .context("timeout")??
+                .payload
+                .into(),
+        )
     }
 
     pub async fn send(&self, bts: &[u8]) -> anyhow::Result<()> {
