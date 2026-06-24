@@ -178,6 +178,20 @@ impl IpStackTcpStream {
             payload,
         })
     }
+
+    /// Aborts a not-yet-established connection by sending a RST to the peer, so
+    /// its `connect()` fails immediately with "connection refused" instead of
+    /// hanging. Use this when the application actively refuses the connection
+    /// (e.g. an upstream dial returned `ConnectionRefused`). For
+    /// unreachable/timeout failures, simply drop the stream instead: that
+    /// leaves the SYN unanswered so the peer's Happy Eyeballs can fall back to
+    /// another address rather than treating the path as up-but-refused.
+    pub fn reset(&mut self) {
+        if let Ok(p) = self.create_rev_packet(RST | ACK, TTL, None, Vec::new()) {
+            let _ = self.packet_sender.try_send(p);
+        }
+        self.tcb.change_state(TcpState::Closed);
+    }
 }
 
 impl IpStackTcpStream {
@@ -537,6 +551,18 @@ impl IpStackTcpStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
+        // If we never sent a SYN-ACK (the peer closed/dropped this stream before
+        // ever reading from it — e.g. because an upstream dial failed), abandon
+        // it silently. Driving the read state machine here would emit a SYN-ACK
+        // and then a FIN, making a dead connection look like one that briefly
+        // connected and immediately closed. That defeats a client's Happy
+        // Eyeballs: a failed IPv6 dial on an IPv4-only path would appear to
+        // connect (so the client commits to it) and then die, instead of
+        // staying unresponsive so the IPv4 attempt can win.
+        if matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
+            self.shutdown.ready();
+            return Poll::Ready(Ok(()));
+        }
         if matches!(self.shutdown, Shutdown::Ready) {
             return Poll::Ready(Ok(()));
         } else if matches!(self.shutdown, Shutdown::None) {
@@ -639,5 +665,65 @@ mod tests {
             .unwrap();
         assert_eq!(n, 3);
         assert_eq!(&second[..3], &[3, 4, 5]);
+    }
+
+    fn unestablished_stream(
+        packet_sender: PacketSender,
+    ) -> IpStackTcpStream {
+        let (_stream_sender, stream_receiver) = async_channel::unbounded();
+        // A fresh Tcb is in SynReceived(false): the SYN arrived but we have not
+        // sent a SYN-ACK yet (i.e. the application never accepted/read it).
+        let tcb = Tcb::new(1000, Duration::from_secs(60));
+        assert_eq!(*tcb.get_state(), TcpState::SynReceived(false));
+        IpStackTcpStream {
+            src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000),
+            dst_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000),
+            stream_receiver: Box::pin(stream_receiver),
+            packet_sender,
+            packet_to_send: None,
+            tcb,
+            mtu: 1500,
+            shutdown: Shutdown::None,
+            write_notify: None,
+        }
+    }
+
+    fn tcp_flags_of(pkt: &crate::packet::NetworkPacket) -> (bool, bool, bool, bool) {
+        match &pkt.transport {
+            crate::packet::TransportHeader::Tcp(h) => (h.syn, h.ack, h.rst, h.fin),
+            _ => panic!("expected a TCP packet"),
+        }
+    }
+
+    // Closing a connection that was never accepted (no SYN-ACK ever sent) must
+    // stay completely silent, so the peer's SYN goes unanswered and its Happy
+    // Eyeballs can fall back. Previously this synthesized a SYN-ACK then a FIN,
+    // making a dead path look like it briefly connected and then closed.
+    #[tokio::test]
+    async fn closing_unaccepted_stream_is_silent() {
+        let (packet_sender, packet_receiver) = async_channel::unbounded();
+        let mut stream = Box::pin(unestablished_stream(packet_sender));
+        let res = poll_fn(|cx| stream.as_mut().poll_close_inner(cx)).await;
+        assert!(res.is_ok());
+        assert!(
+            packet_receiver.try_recv().is_err(),
+            "closing an unaccepted stream must not emit any packet (no SYN-ACK)"
+        );
+    }
+
+    // reset() on an unaccepted connection must send a RST (not complete the
+    // handshake), so the peer's connect() fails fast with "connection refused".
+    #[tokio::test]
+    async fn reset_sends_rst_not_syn_ack() {
+        let (packet_sender, packet_receiver) = async_channel::unbounded();
+        let mut stream = unestablished_stream(packet_sender);
+        stream.reset();
+        let pkt = packet_receiver
+            .try_recv()
+            .expect("reset must emit a RST packet");
+        let (syn, ack, rst, _fin) = tcp_flags_of(&pkt);
+        assert!(rst, "reset must set RST");
+        assert!(ack, "reset must set ACK");
+        assert!(!syn, "reset must not complete the handshake");
     }
 }

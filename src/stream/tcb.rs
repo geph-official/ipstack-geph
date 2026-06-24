@@ -201,7 +201,7 @@ impl Tcb {
         if self.state == TcpState::Established {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
                 let mut inflight_packet = self.inflight_packets.remove(i);
-                tracing::warn!("packet {} is acked", inflight_packet.seq);
+                tracing::trace!("packet {} is acked", inflight_packet.seq);
                 let distance = ack.wrapping_sub(inflight_packet.seq) as usize;
                 if distance < inflight_packet.payload.len() {
                     inflight_packet.payload.drain(0..distance);

@@ -46,6 +46,21 @@ impl IpStackTcpStream {
     pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
+
+    /// Aborts a not-yet-established connection by sending a RST to the peer, so
+    /// its `connect()` fails immediately with "connection refused". Use this
+    /// when the application actively refuses the connection (e.g. an upstream
+    /// dial returned `ConnectionRefused`). For unreachable/timeout failures,
+    /// just drop the stream instead, so the SYN stays unanswered and the peer's
+    /// Happy Eyeballs can fall back to another address.
+    ///
+    /// Taking the inner stream here also bypasses the graceful-shutdown spawn in
+    /// `Drop`, which would otherwise complete the handshake before closing.
+    pub fn reset(&mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            inner.reset();
+        }
+    }
 }
 
 impl AsyncRead for IpStackTcpStream {
