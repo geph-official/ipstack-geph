@@ -80,7 +80,20 @@ impl IpStackTcpStream {
         if tcp.inner().rst {
             warn!("not responding RST with RST")
         } else {
-            let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
+            // A stray packet for a flow we know nothing about (e.g. a
+            // connection that predates this IpStack instance). Reset it so
+            // the peer's kernel tears the connection down promptly. The RST's
+            // sequence number must be the stray packet's acknowledgment
+            // number — that is exactly the peer's RCV.NXT, and per RFC 5961
+            // anything else is answered with a challenge ACK instead of an
+            // abort (a fresh Tcb's random sequence number would leave the
+            // peer's connection alive and wedged indefinitely).
+            let rst_seq = if tcp.inner().ack {
+                tcp.inner().acknowledgment_number
+            } else {
+                0
+            };
+            let pkt = stream.create_rev_packet(RST | ACK, TTL, rst_seq, Vec::new())?;
             if let Err(err) = stream.packet_sender.try_send(pkt) {
                 warn!("Error sending RST/ACK packet: {:?}", err);
             }
@@ -202,15 +215,32 @@ impl IpStackTcpStream {
     ) -> Poll<std::io::Result<usize>> {
         loop {
             // Check for RTO expiration and retransmit the oldest
-            // unacknowledged packet if necessary.
+            // unacknowledged packet if necessary. If retransmissions have gone
+            // unanswered past the give-up point, reset the connection instead
+            // of retransmitting into a dead flow for the rest of tcp_timeout.
             let poll_rto = !self.tcb.inflight_packets.is_empty();
             if poll_rto && self.tcb.poll_rto(cx) {
+                if self.tcb.rto_exhausted() {
+                    tracing::warn!(
+                        strikes = self.tcb.rto_strikes(),
+                        dst = display(self.src_addr),
+                        "too many unanswered retransmissions, resetting connection"
+                    );
+                    let _ = self
+                        .packet_sender
+                        .try_send(self.create_rev_packet(RST | ACK, TTL, None, Vec::new())
+                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?);
+                    self.tcb.change_state(TcpState::Closed);
+                    self.shutdown.ready();
+                    return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
+                }
                 let pkt = self.tcb.inflight_packets.first().unwrap();
                 if let Ok(rp) = self.create_rev_packet(PSH | ACK, TTL, pkt.seq, pkt.payload.clone())
                 {
-                    tracing::warn!(
-                        "retransmitting {}; this is unusual unless buffers are full",
-                        pkt.seq
+                    tracing::debug!(
+                        seq = pkt.seq,
+                        strikes = self.tcb.rto_strikes(),
+                        "retransmitting unacknowledged packet"
                     );
                     let _ = self.packet_sender.try_send(rp);
                 }
@@ -708,6 +738,41 @@ mod tests {
         assert!(
             packet_receiver.try_recv().is_err(),
             "closing an unaccepted stream must not emit any packet (no SYN-ACK)"
+        );
+    }
+
+    // A stray (non-SYN) packet for an unknown flow must be answered with a
+    // RST whose sequence number equals the stray packet's acknowledgment
+    // number (the peer's RCV.NXT). Anything else fails the peer kernel's
+    // RFC 5961 in-window check, is answered with a challenge ACK, and leaves
+    // the peer's connection alive-but-wedged indefinitely.
+    #[tokio::test]
+    async fn stray_packet_rst_echoes_acknowledgment_number() {
+        let (packet_sender, packet_receiver) = async_channel::unbounded();
+        let (_stream_sender, stream_receiver) = async_channel::unbounded();
+        let mut header = etherparse::TcpHeader::new(1000, 2000, 123456, 64000);
+        header.ack = true;
+        header.acknowledgment_number = 987654;
+        let res = IpStackTcpStream::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000),
+            (&header).into(),
+            packet_sender,
+            stream_receiver,
+            1500,
+            Duration::from_secs(60),
+        );
+        assert!(res.is_err(), "a stray non-SYN packet must not create a stream");
+        let pkt = packet_receiver
+            .try_recv()
+            .expect("stray packet must be answered with a RST");
+        let crate::packet::TransportHeader::Tcp(tcp) = &pkt.transport else {
+            panic!("expected a TCP packet");
+        };
+        assert!(tcp.rst);
+        assert_eq!(
+            tcp.sequence_number, 987654,
+            "RST seq must echo the stray packet's ack number"
         );
     }
 

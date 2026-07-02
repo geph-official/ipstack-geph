@@ -30,5 +30,5 @@ tokio = { version = "1", features = ["rt", "time", "io-util"] }
 
 [dev-dependencies]
 criterion="0.5"
-tokio = { version = "1", features = ["rt", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "time", "io-util", "macros", "test-util"] }
 

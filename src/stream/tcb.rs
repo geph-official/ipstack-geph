@@ -12,6 +12,14 @@ const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const MAX_INFLIGHT_SEGMENTS: usize = 16;
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 const RTO: Duration = Duration::from_millis(100);
+// Exponential backoff for the RTO timer. Without backoff, a peer that never
+// ACKs (e.g. its socket vanished and the RST never reached us) is retransmitted
+// to every 100 ms for the whole tcp_timeout — potentially hours of 10 pkt/s
+// garbage per dead flow. Back off to RTO_MAX and give up entirely after
+// MAX_RETRANSMITS consecutive unanswered retransmissions (~35 s), resetting the
+// connection like a real TCP stack would.
+const RTO_MAX: Duration = Duration::from_millis(3200);
+const MAX_RETRANSMITS: u32 = 15;
 // tokio has no "never" timer, so we use a deadline far enough in the future to
 // stand in for one without overflowing the instant arithmetic.
 const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
@@ -52,11 +60,14 @@ pub(super) struct Tcb {
 
     // Very simple RTO (Retransmission TimeOut) timer. Whenever there is at
     // at least one un-acknowledged packet in `inflight_packets` we arm this
-    // timer for a fixed 100 ms. When the timer fires the oldest un-
-    // acknowledged packet should be retransmitted and the timer re-armed if
-    // there are still packets in flight. This is an extremely rudimentary
-    // implementation that does not try to follow RFC 6298.
+    // timer, starting at 100 ms and doubling per unanswered retransmission up
+    // to RTO_MAX. When the timer fires the oldest un-acknowledged packet
+    // should be retransmitted and the timer re-armed if there are still
+    // packets in flight. This does not try to follow RFC 6298 beyond the
+    // backoff-and-give-up shape.
     rto_timer: Pin<Box<Sleep>>,
+    rto_current: Duration,
+    rto_strikes: u32,
 }
 
 impl Tcb {
@@ -81,6 +92,8 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
 
             rto_timer: Box::pin(sleep_until(TokioInstant::now() + FAR_FUTURE)),
+            rto_current: RTO,
+            rto_strikes: 0,
         }
     }
     pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
@@ -89,6 +102,7 @@ impl Tcb {
         self.inflight_packets.push(InflightPacket::new(seq, buf));
         self.seq = self.seq.wrapping_add(buf_len);
         if was_empty && buf_len > 0 {
+            self.reset_rto_backoff();
             self.arm_rto();
         }
     }
@@ -196,6 +210,7 @@ impl Tcb {
         if seq_before(ack, self.last_ack) || seq_after(ack, self.seq) {
             return;
         }
+        let advanced = seq_after(ack, self.last_ack);
         self.last_ack = ack;
 
         if self.state == TcpState::Established {
@@ -215,7 +230,14 @@ impl Tcb {
             });
             if self.inflight_packets.is_empty() {
                 self.disarm_rto();
-            } else {
+            } else if advanced {
+                // Forward ACK progress: the peer is alive and consuming, so
+                // restart the retransmission clock from scratch. Packets that
+                // merely repeat the same ACK deliberately do NOT re-arm the
+                // timer — that would let a peer that talks without ever
+                // ACKing postpone retransmission (and the give-up below)
+                // forever.
+                self.reset_rto_backoff();
                 self.arm_rto();
             }
         }
@@ -227,18 +249,38 @@ impl Tcb {
 
     //==================== RTO helpers ====================
 
-    // Poll the RTO timer. Returns true if it has fired.
+    // Poll the RTO timer. Returns true if it has fired. Each firing counts as
+    // a strike and doubles the next timeout (capped at RTO_MAX); the caller
+    // should check `rto_exhausted` and reset the connection once the strikes
+    // run out.
     pub(crate) fn poll_rto(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         if Pin::new(&mut self.rto_timer).poll(cx).is_ready() {
             if self.inflight_packets.is_empty() {
                 self.disarm_rto();
             } else {
+                self.rto_strikes += 1;
+                self.rto_current = (self.rto_current * 2).min(RTO_MAX);
                 self.arm_rto();
             }
             true
         } else {
             false
         }
+    }
+
+    // Whether retransmission has gone unanswered for so long that the
+    // connection should be considered dead.
+    pub(crate) fn rto_exhausted(&self) -> bool {
+        self.rto_strikes > MAX_RETRANSMITS
+    }
+
+    pub(crate) fn rto_strikes(&self) -> u32 {
+        self.rto_strikes
+    }
+
+    fn reset_rto_backoff(&mut self) {
+        self.rto_current = RTO;
+        self.rto_strikes = 0;
     }
 
     pub(crate) fn reset_timeout(&mut self) {
@@ -249,7 +291,7 @@ impl Tcb {
     fn arm_rto(&mut self) {
         self.rto_timer
             .as_mut()
-            .reset(TokioInstant::now() + RTO);
+            .reset(TokioInstant::now() + self.rto_current);
     }
 
     fn disarm_rto(&mut self) {
@@ -315,6 +357,58 @@ mod tests {
         assert!(seq_after(2, u32::MAX - 2));
         assert!(seq_before(u32::MAX - 2, 2));
         assert!(seq_lte(2, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rto_gives_up_after_max_unanswered_retransmissions() {
+        let mut tcb = Tcb::new(0, Duration::from_secs(3600));
+        tcb.change_state(TcpState::Established);
+        tcb.seq = 100;
+        tcb.last_ack = 100;
+        tcb.add_inflight_packet(100, vec![0; 10]);
+
+        let mut fired = 0u32;
+        while !tcb.rto_exhausted() {
+            std::future::poll_fn(|cx| {
+                if tcb.poll_rto(cx) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            fired += 1;
+            assert!(fired < 100, "give-up must trigger before 100 firings");
+        }
+        assert_eq!(fired, MAX_RETRANSMITS + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_progress_resets_rto_backoff() {
+        let mut tcb = Tcb::new(0, Duration::from_secs(3600));
+        tcb.change_state(TcpState::Established);
+        tcb.seq = 100;
+        tcb.last_ack = 100;
+        tcb.add_inflight_packet(100, vec![0; 10]);
+        tcb.add_inflight_packet(110, vec![0; 10]);
+
+        // Take a few strikes...
+        for _ in 0..3 {
+            std::future::poll_fn(|cx| {
+                if tcb.poll_rto(cx) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+        assert_eq!(tcb.rto_strikes(), 3);
+
+        // ...then ACK the first packet: strikes reset, timer re-armed.
+        tcb.change_last_ack(110);
+        assert_eq!(tcb.rto_strikes(), 0);
+        assert!(!tcb.inflight_packets.is_empty());
     }
 
     #[tokio::test]
