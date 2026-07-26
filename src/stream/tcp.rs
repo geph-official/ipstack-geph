@@ -441,6 +441,10 @@ impl IpStackTcpStream {
                                 continue;
                             }
                             self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                            if let Some(ref n) = self.write_notify {
+                                n.wake_by_ref();
+                                self.write_notify = None;
+                            };
 
                             if p.payload.is_empty()
                                 || self.tcb.get_ack() != t.inner().sequence_number
@@ -660,7 +664,25 @@ mod tests {
     use std::{
         future::poll_fn,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        task::Wake,
     };
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[tokio::test]
     async fn partial_reads_keep_remaining_payload() {
@@ -695,6 +717,62 @@ mod tests {
             .unwrap();
         assert_eq!(n, 3);
         assert_eq!(&second[..3], &[3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn psh_ack_wakes_blocked_writer() {
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let (stream_sender, stream_receiver) = async_channel::unbounded();
+        let mut tcb = Tcb::new(1000, Duration::from_secs(60));
+        tcb.change_state(TcpState::Established);
+        let first_unacked_seq = tcb.get_seq();
+        tcb.add_inflight_packet(first_unacked_seq, vec![0; 16]);
+        let peer_ack = tcb.get_seq();
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let mut stream = Box::pin(IpStackTcpStream {
+            src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000),
+            dst_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000),
+            stream_receiver: Box::pin(stream_receiver),
+            packet_sender,
+            packet_to_send: None,
+            tcb,
+            mtu: 1500,
+            shutdown: Shutdown::None,
+            write_notify: Some(Waker::from(wake_counter.clone())),
+        });
+
+        let payload = vec![1];
+        let ip = Ipv4Header::new(
+            payload.len() as u16,
+            TTL,
+            IpNumber::TCP,
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+        )
+        .unwrap();
+        let mut tcp = etherparse::TcpHeader::new(1000, 2000, 1000, u16::MAX);
+        tcp.psh = true;
+        tcp.ack = true;
+        tcp.acknowledgment_number = peer_ack;
+        stream_sender
+            .try_send(NetworkPacket {
+                ip: IpHeader::Ipv4(ip),
+                transport: TransportHeader::Tcp(tcp),
+                payload,
+            })
+            .unwrap();
+
+        let mut read_buf = [0];
+        let read = poll_fn(|cx| stream.as_mut().poll_read_inner(cx, &mut read_buf))
+            .await
+            .unwrap();
+
+        assert_eq!(read, 1);
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+        assert!(stream.write_notify.is_none());
+        assert_eq!(stream.tcb.get_last_ack(), peer_ack);
+        assert!(stream.tcb.inflight_packets.is_empty());
     }
 
     fn unestablished_stream(
