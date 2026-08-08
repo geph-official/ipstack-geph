@@ -2,7 +2,7 @@
 authors = ['Narrowlink <opensource@narrowlink.com>', 'Nullchinchilla <nullchinchilla@pm.me>']
 description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for transparent proxies'
 name = "ipstack-geph"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/geph-official/ipstack'
@@ -31,4 +31,3 @@ tokio = { version = "1", features = ["rt", "time", "io-util"] }
 [dev-dependencies]
 criterion="0.5"
 tokio = { version = "1", features = ["rt", "time", "io-util", "macros", "test-util"] }
-
