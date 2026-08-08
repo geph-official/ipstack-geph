@@ -2,7 +2,7 @@ use crate::{
     packet::IpStackPacketProtocol,
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use bytes::Bytes;
 use log::trace;
 use moka::{sync::Cache, Expiry};
@@ -175,14 +175,35 @@ fn process_device_read(
         ));
     }
 
-    if let Some(sender) = sessions.get(&packet.network_tuple()) {
-        let _ = sender.try_send(packet);
-        None
-    } else {
-        let (a, b) = create_stream(packet.clone(), config, pkt_sender)?;
-        sessions.insert(packet.network_tuple(), a);
-        Some(b)
+    let tuple = packet.network_tuple();
+    if let Some(sender) = sessions.get(&tuple) {
+        match sender.try_send(packet) {
+            Ok(()) => return None,
+            Err(TrySendError::Full(_packet)) => {
+                trace!("dropping packet for congested session {tuple:?}");
+                return None;
+            }
+            Err(TrySendError::Closed(packet)) => {
+                trace!("replacing closed session {tuple:?}");
+                sessions.remove(&tuple);
+                return install_stream(packet, sessions, pkt_sender, config);
+            }
+        }
     }
+
+    install_stream(packet, sessions, pkt_sender, config)
+}
+
+fn install_stream(
+    packet: NetworkPacket,
+    sessions: &mut SessionCollection,
+    pkt_sender: PacketSender,
+    config: &IpStackConfig,
+) -> Option<IpStackStream> {
+    let tuple = packet.network_tuple();
+    let (sender, stream) = create_stream(packet, config, pkt_sender)?;
+    sessions.insert(tuple, sender);
+    Some(stream)
 }
 
 fn create_stream(
@@ -370,6 +391,82 @@ mod tests {
         let rt = current_thread_rt();
         assert_eq!(&*rt.block_on(stream.recv()).unwrap(), b"one");
         assert_eq!(&*rt.block_on(stream.recv()).unwrap(), b"two");
+    }
+
+    #[test]
+    fn process_device_read_replaces_closed_udp_session_and_replays_packet() {
+        let config = IpStackConfig::default();
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let mut sessions = Cache::builder()
+            .expire_after(SessionExpiry {
+                tcp_timeout: config.tcp_timeout,
+                udp_timeout: config.udp_timeout,
+            })
+            .build();
+
+        let first = udp_packet(1000, 2000, b"one");
+        let Some(IpStackStream::Udp(stream)) =
+            process_device_read(&first, &mut sessions, packet_sender.clone(), &config)
+        else {
+            panic!("expected first UDP packet to create stream");
+        };
+        drop(stream);
+
+        let second = udp_packet(1000, 2000, b"two");
+        let Some(IpStackStream::Udp(replacement)) =
+            process_device_read(&second, &mut sessions, packet_sender, &config)
+        else {
+            panic!("expected closed UDP session to be replaced");
+        };
+
+        let rt = current_thread_rt();
+        assert_eq!(&*rt.block_on(replacement.recv()).unwrap(), b"two");
+    }
+
+    #[test]
+    fn process_device_read_drops_udp_packet_when_live_session_queue_is_full() {
+        let config = IpStackConfig::default();
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let mut sessions = Cache::builder()
+            .expire_after(SessionExpiry {
+                tcp_timeout: config.tcp_timeout,
+                udp_timeout: config.udp_timeout,
+            })
+            .build();
+
+        let first = udp_packet(1000, 2000, b"0");
+        let Some(IpStackStream::Udp(stream)) =
+            process_device_read(&first, &mut sessions, packet_sender.clone(), &config)
+        else {
+            panic!("expected first UDP packet to create stream");
+        };
+
+        for payload in 1u8..10 {
+            let packet = udp_packet(1000, 2000, &[payload]);
+            assert!(
+                process_device_read(&packet, &mut sessions, packet_sender.clone(), &config)
+                    .is_none()
+            );
+        }
+
+        let dropped = udp_packet(1000, 2000, b"dropped");
+        assert!(
+            process_device_read(&dropped, &mut sessions, packet_sender.clone(), &config).is_none()
+        );
+
+        let rt = current_thread_rt();
+        for expected in 0u8..10 {
+            let received = rt.block_on(stream.recv()).unwrap();
+            if expected == 0 {
+                assert_eq!(&*received, b"0");
+            } else {
+                assert_eq!(&*received, &[expected]);
+            }
+        }
+
+        let after = udp_packet(1000, 2000, b"after");
+        assert!(process_device_read(&after, &mut sessions, packet_sender, &config).is_none());
+        assert_eq!(&*rt.block_on(stream.recv()).unwrap(), b"after");
     }
 
     #[test]
