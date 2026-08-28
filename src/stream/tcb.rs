@@ -1,12 +1,7 @@
 use tokio::time::{sleep_until, Instant as TokioInstant, Sleep};
 
 use crate::packet::TcpHeaderWrapper;
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    pin::Pin,
-    time::Duration,
-};
+use std::{collections::BTreeMap, future::Future, pin::Pin, time::Duration};
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const MAX_INFLIGHT_SEGMENTS: usize = 16;
@@ -33,7 +28,7 @@ pub enum TcpState {
     Closed,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum PacketStatus {
     WindowUpdate,
     Invalid,
@@ -54,9 +49,9 @@ pub(super) struct Tcb {
     recv_window: u16,
     send_window: u16,
     state: TcpState,
-    avg_send_window: (u64, u64), // (avg, count)
     pub(super) inflight_packets: Vec<InflightPacket>,
     unordered_packets: BTreeMap<u32, UnorderedPacket>,
+    pending_fin: Option<u32>,
 
     // Very simple RTO (Retransmission TimeOut) timer. Whenever there is at
     // at least one un-acknowledged packet in `inflight_packets` we arm this
@@ -87,9 +82,9 @@ impl Tcb {
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::SynReceived(false),
-            avg_send_window: (1, 1),
             inflight_packets: Vec::new(),
             unordered_packets: BTreeMap::new(),
+            pending_fin: None,
 
             rto_timer: Box::pin(sleep_until(TokioInstant::now() + FAR_FUTURE)),
             rto_current: RTO,
@@ -149,17 +144,12 @@ impl Tcb {
         &self.state
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
-        let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64)
-            / (self.avg_send_window.1 + 1);
-        self.avg_send_window.0 = avg_send_window;
-        self.avg_send_window.1 += 1;
         self.send_window = window;
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+    pub(super) fn get_available_send_window(&self) -> u16 {
+        let bytes_in_flight = self.seq.wrapping_sub(self.last_ack);
         self.send_window
-    }
-    pub(super) fn get_avg_send_window(&self) -> u64 {
-        self.avg_send_window.0
+            .saturating_sub(bytes_in_flight.min(u16::MAX as u32) as u16)
     }
     pub(super) fn change_recv_window(&mut self, window: u16) {
         self.recv_window = window;
@@ -221,7 +211,7 @@ impl Tcb {
                 if distance < inflight_packet.payload.len() {
                     inflight_packet.payload.drain(0..distance);
                     inflight_packet.seq = ack;
-                    self.inflight_packets.push(inflight_packet);
+                    self.inflight_packets.insert(i, inflight_packet);
                 }
             }
             self.inflight_packets.retain(|p| {
@@ -245,6 +235,22 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         self.inflight_packets.len() >= MAX_INFLIGHT_SEGMENTS
             || self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
+    }
+
+    pub(super) fn record_fin(&mut self, sequence_number: u32) {
+        if !seq_before(sequence_number, self.ack) {
+            self.pending_fin = Some(sequence_number);
+        }
+    }
+
+    pub(super) fn consume_pending_fin(&mut self) -> bool {
+        if self.pending_fin == Some(self.ack) {
+            self.pending_fin = None;
+            self.add_ack(1);
+            true
+        } else {
+            false
+        }
     }
 
     //==================== RTO helpers ====================
@@ -426,5 +432,37 @@ mod tests {
         assert_eq!(tcb.inflight_packets.len(), 1);
         assert_eq!(tcb.inflight_packets[0].seq, 2);
         assert_eq!(tcb.inflight_packets[0].payload.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn partial_ack_keeps_oldest_unacked_segment_first() {
+        let mut tcb = Tcb::new(0, Duration::from_secs(60));
+        tcb.change_state(TcpState::Established);
+        tcb.seq = 100;
+        tcb.last_ack = 100;
+        tcb.add_inflight_packet(100, vec![0; 100]);
+        tcb.add_inflight_packet(200, vec![0; 100]);
+
+        tcb.change_last_ack(150);
+
+        assert_eq!(tcb.inflight_packets.len(), 2);
+        assert_eq!(tcb.inflight_packets[0].seq, 150);
+        assert_eq!(tcb.inflight_packets[0].payload.len(), 50);
+        assert_eq!(tcb.inflight_packets[1].seq, 200);
+    }
+
+    #[tokio::test]
+    async fn advertised_window_accounts_for_bytes_in_flight() {
+        let mut tcb = Tcb::new(0, Duration::from_secs(60));
+        tcb.change_state(TcpState::Established);
+        tcb.seq = 100;
+        tcb.last_ack = 100;
+        tcb.change_send_window(10);
+
+        assert_eq!(tcb.get_available_send_window(), 10);
+        tcb.add_inflight_packet(100, vec![0; 8]);
+        assert_eq!(tcb.get_available_send_window(), 2);
+        tcb.add_inflight_packet(108, vec![0; 2]);
+        assert_eq!(tcb.get_available_send_window(), 0);
     }
 }

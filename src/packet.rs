@@ -44,6 +44,9 @@ pub struct NetworkPacket {
     pub(crate) ip: IpHeader,
     pub(crate) transport: TransportHeader,
     pub(crate) payload: Vec<u8>,
+    // Internal-only identity used by TCP teardown notifications. This is never
+    // serialized onto the wire, and parsed device packets never carry one.
+    pub(crate) teardown_generation: Option<u64>,
 }
 impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> anyhow::Result<Self> {
@@ -75,6 +78,7 @@ impl NetworkPacket {
             ip,
             transport,
             payload,
+            teardown_generation: None,
         })
     }
     pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {

@@ -19,10 +19,10 @@ jobs:
     - name: rustfmt
       run: cargo fmt --all -- --check
     - name: check
-      run: cargo check --verbose
+      run: cargo check --locked --verbose
     - name: clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build --verbose --examples --tests --all-features
+      run: cargo build --locked --verbose --examples --tests --all-features
     - name: Test
-      run: cargo test --all-features --examples
+      run: cargo test --locked --all-features --examples

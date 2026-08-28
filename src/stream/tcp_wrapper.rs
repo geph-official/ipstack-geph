@@ -4,6 +4,8 @@ use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
 use crate::{packet::TcpHeaderWrapper, PacketSender};
 use std::{net::SocketAddr, pin::Pin, time::Duration};
 
+const TCP_PACKET_QUEUE_CAPACITY: usize = 64;
+
 pub struct IpStackTcpStream {
     inner: Option<Box<IpStackTcpStreamInner>>,
     peer_addr: SocketAddr,
@@ -19,8 +21,9 @@ impl IpStackTcpStream {
         pkt_sender: PacketSender,
         mtu: u16,
         tcp_timeout: Duration,
+        session_generation: u64,
     ) -> anyhow::Result<IpStackTcpStream> {
-        let (stream_sender, stream_receiver) = async_channel::unbounded();
+        let (stream_sender, stream_receiver) = async_channel::bounded(TCP_PACKET_QUEUE_CAPACITY);
         IpStackTcpStreamInner::new(
             local_addr,
             peer_addr,
@@ -31,7 +34,7 @@ impl IpStackTcpStream {
             tcp_timeout,
         )
         .map(|inner| IpStackTcpStream {
-            inner: Some(Box::new(inner)),
+            inner: Some(Box::new(inner.with_session_generation(session_generation))),
             peer_addr,
             local_addr,
             stream_sender,

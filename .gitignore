@@ -1,7 +1,6 @@
 .vscode/
 .VSCodeCounter/
 /target/
-Cargo.lock
 .DS_Store
 .AppleDouble
 **/*.rs.bk

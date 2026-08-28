@@ -89,6 +89,7 @@ impl IpStackUdpStream {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
+                    teardown_generation: None,
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -121,6 +122,7 @@ impl IpStackUdpStream {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
+                    teardown_generation: None,
                 })
             }
             _ => unreachable!(),

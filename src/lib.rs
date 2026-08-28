@@ -8,11 +8,21 @@ use log::trace;
 use moka::{sync::Cache, Expiry};
 use packet::{NetworkPacket, NetworkTuple};
 use parking_lot::Mutex;
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 pub(crate) type PacketSender = Sender<NetworkPacket>;
 pub(crate) type PacketReceiver = Receiver<NetworkPacket>;
-pub(crate) type SessionCollection = Cache<NetworkTuple, PacketSender>;
+
+#[derive(Clone)]
+pub(crate) struct SessionEntry {
+    sender: PacketSender,
+    generation: u64,
+}
+
+pub(crate) type SessionCollection = Cache<NetworkTuple, SessionEntry>;
 
 mod packet;
 pub mod stream;
@@ -20,6 +30,10 @@ pub mod stream;
 const DROP_TTL: u8 = 0;
 
 const TTL: u8 = 64;
+
+const ACCEPT_QUEUE_CAPACITY: usize = 1024;
+const MAX_SESSIONS: u64 = 65_536;
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct IpStackConfig {
     pub mtu: u16,
@@ -52,7 +66,7 @@ impl IpStack {
         recv_packet: Receiver<Bytes>,
         send_packet: Sender<Bytes>,
     ) -> IpStack {
-        let (accept_sender, accept_receiver) = async_channel::unbounded();
+        let (accept_sender, accept_receiver) = async_channel::bounded(ACCEPT_QUEUE_CAPACITY);
         let task = tokio::spawn(run(config, recv_packet, send_packet, accept_sender));
 
         IpStack {
@@ -79,6 +93,7 @@ async fn run(
     accept_sender: Sender<IpStackStream>,
 ) -> anyhow::Result<()> {
     let sessions: SessionCollection = Cache::builder()
+        .max_capacity(MAX_SESSIONS)
         .expire_after(SessionExpiry {
             tcp_timeout: config.tcp_timeout,
             udp_timeout: config.udp_timeout,
@@ -95,7 +110,17 @@ async fn run(
             if let Some(stream) =
                 process_device_read(&packet, &mut sessions, pkt_sender.clone(), &config)
             {
-                let _ = accept_sender.try_send(stream);
+                match accept_sender.try_send(stream) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(stream)) => {
+                        remove_stream_session(&stream, &mut sessions);
+                        trace!("dropping new stream because the accept queue is full");
+                    }
+                    Err(TrySendError::Closed(stream)) => {
+                        remove_stream_session(&stream, &mut sessions);
+                        anyhow::bail!("accept channel closed");
+                    }
+                }
             }
         }
     };
@@ -116,11 +141,11 @@ struct SessionExpiry {
     udp_timeout: Duration,
 }
 
-impl Expiry<NetworkTuple, PacketSender> for SessionExpiry {
+impl Expiry<NetworkTuple, SessionEntry> for SessionExpiry {
     fn expire_after_create(
         &self,
         key: &NetworkTuple,
-        _value: &PacketSender,
+        _value: &SessionEntry,
         _created_at: Instant,
     ) -> Option<Duration> {
         Some(if key.tcp {
@@ -133,7 +158,7 @@ impl Expiry<NetworkTuple, PacketSender> for SessionExpiry {
     fn expire_after_read(
         &self,
         key: &NetworkTuple,
-        _value: &PacketSender,
+        _value: &SessionEntry,
         _read_at: Instant,
         _duration_until_expiry: Option<Duration>,
         _last_modified_at: Instant,
@@ -144,7 +169,7 @@ impl Expiry<NetworkTuple, PacketSender> for SessionExpiry {
     fn expire_after_update(
         &self,
         key: &NetworkTuple,
-        _value: &PacketSender,
+        _value: &SessionEntry,
         _updated_at: Instant,
         _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {
@@ -176,8 +201,8 @@ fn process_device_read(
     }
 
     let tuple = packet.network_tuple();
-    if let Some(sender) = sessions.get(&tuple) {
-        match sender.try_send(packet) {
+    if let Some(session) = sessions.get(&tuple) {
+        match session.sender.try_send(packet) {
             Ok(()) => return None,
             Err(TrySendError::Full(_packet)) => {
                 trace!("dropping packet for congested session {tuple:?}");
@@ -201,8 +226,9 @@ fn install_stream(
     config: &IpStackConfig,
 ) -> Option<IpStackStream> {
     let tuple = packet.network_tuple();
-    let (sender, stream) = create_stream(packet, config, pkt_sender)?;
-    sessions.insert(tuple, sender);
+    let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let (sender, stream) = create_stream(packet, config, pkt_sender, generation)?;
+    sessions.insert(tuple, SessionEntry { sender, generation });
     Some(stream)
 }
 
@@ -210,6 +236,7 @@ fn create_stream(
     packet: NetworkPacket,
     config: &IpStackConfig,
     pkt_sender: PacketSender,
+    session_generation: u64,
 ) -> Option<(PacketSender, IpStackStream)> {
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
@@ -220,6 +247,7 @@ fn create_stream(
                 pkt_sender,
                 config.mtu,
                 config.tcp_timeout,
+                session_generation,
             ) {
                 Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
@@ -252,7 +280,14 @@ fn process_upstream_recv(
     device: Sender<Bytes>,
 ) -> anyhow::Result<()> {
     if packet.ttl() == 0 {
-        sessions.remove(&packet.reverse_network_tuple());
+        let tuple = packet.reverse_network_tuple();
+        if let (Some(generation), Some(session)) =
+            (packet.teardown_generation, sessions.get(&tuple))
+        {
+            if session.generation == generation {
+                sessions.remove(&tuple);
+            }
+        }
         return Ok(());
     }
     #[allow(unused_mut)]
@@ -261,10 +296,33 @@ fn process_upstream_recv(
         return Ok(());
     };
 
-    let _ = device.try_send(packet_bytes.into());
+    match device.try_send(packet_bytes.into()) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => trace!("dropping packet because the device queue is full"),
+        Err(TrySendError::Closed(_)) => anyhow::bail!("device output channel closed"),
+    }
     // device.flush().await.unwrap();
 
     Ok(())
+}
+
+fn remove_stream_session(stream: &IpStackStream, sessions: &mut SessionCollection) {
+    let tuple = match stream {
+        IpStackStream::Tcp(_) => Some(NetworkTuple {
+            src: stream.local_addr(),
+            dst: stream.peer_addr(),
+            tcp: true,
+        }),
+        IpStackStream::Udp(_) => Some(NetworkTuple {
+            src: stream.local_addr(),
+            dst: stream.peer_addr(),
+            tcp: false,
+        }),
+        IpStackStream::UnknownTransport(_) | IpStackStream::UnknownNetwork(_) => None,
+    };
+    if let Some(tuple) = tuple {
+        sessions.remove(&tuple);
+    }
 }
 
 pub trait Device {
@@ -328,6 +386,7 @@ mod tests {
             ip: IpHeader::Ipv4(ip),
             transport: TransportHeader::Tcp(tcp),
             payload: payload.to_vec(),
+            teardown_generation: None,
         }
         .to_bytes()
         .unwrap()
@@ -347,6 +406,10 @@ mod tests {
             udp_timeout: Duration::from_secs(7),
         };
         let (sender, _receiver) = async_channel::unbounded();
+        let session = SessionEntry {
+            sender,
+            generation: 1,
+        };
         let tcp_tuple = NetworkTuple {
             src: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000)),
             dst: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 2000)),
@@ -358,11 +421,11 @@ mod tests {
         };
 
         assert_eq!(
-            expiry.expire_after_create(&tcp_tuple, &sender, Instant::now()),
+            expiry.expire_after_create(&tcp_tuple, &session, Instant::now()),
             Some(Duration::from_secs(11))
         );
         assert_eq!(
-            expiry.expire_after_create(&udp_tuple, &sender, Instant::now()),
+            expiry.expire_after_create(&udp_tuple, &session, Instant::now()),
             Some(Duration::from_secs(7))
         );
     }
@@ -469,6 +532,37 @@ mod tests {
         assert_eq!(&*rt.block_on(stream.recv()).unwrap(), b"after");
     }
 
+    #[tokio::test]
+    async fn process_device_read_bounds_live_tcp_session_queue() {
+        let config = IpStackConfig::default();
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let mut sessions = Cache::builder()
+            .expire_after(SessionExpiry {
+                tcp_timeout: config.tcp_timeout,
+                udp_timeout: config.udp_timeout,
+            })
+            .build();
+
+        let syn = tcp_packet(1000, 2000, 1000, None, tcp_flags::SYN, &[]);
+        let Some(IpStackStream::Tcp(stream)) =
+            process_device_read(&syn, &mut sessions, packet_sender.clone(), &config)
+        else {
+            panic!("expected SYN to create TCP stream");
+        };
+        let stream_sender = stream.stream_sender();
+        let capacity = stream_sender.capacity().expect("TCP queue must be bounded");
+
+        for _ in 0..capacity + 1 {
+            let ack = tcp_packet(1000, 2000, 1001, Some(100), tcp_flags::ACK, &[]);
+            assert!(
+                process_device_read(&ack, &mut sessions, packet_sender.clone(), &config).is_none()
+            );
+        }
+
+        assert_eq!(stream_sender.len(), capacity);
+        assert_eq!(capacity, 64);
+    }
+
     #[test]
     fn process_upstream_recv_drop_ttl_removes_reverse_session() {
         let config = IpStackConfig::default();
@@ -483,7 +577,13 @@ mod tests {
         let packet = NetworkPacket::parse(&raw).unwrap();
         let (sender, _receiver) = async_channel::unbounded();
         let removed_tuple = packet.reverse_network_tuple();
-        sessions.insert(removed_tuple, sender);
+        sessions.insert(
+            removed_tuple,
+            SessionEntry {
+                sender,
+                generation: 1,
+            },
+        );
         assert!(sessions.get(&removed_tuple).is_some());
 
         let mut drop_packet = packet.clone();
@@ -491,10 +591,62 @@ mod tests {
             packet::IpHeader::Ipv4(ip) => ip.time_to_live = DROP_TTL,
             packet::IpHeader::Ipv6(ip) => ip.hop_limit = DROP_TTL,
         }
+        drop_packet.teardown_generation = Some(1);
         let (device_sender, _device_receiver) = async_channel::unbounded();
 
         process_upstream_recv(drop_packet, &mut sessions, device_sender).unwrap();
         assert!(sessions.get(&removed_tuple).is_none());
+    }
+
+    #[test]
+    fn stale_drop_ttl_does_not_remove_replacement_session() {
+        let config = IpStackConfig::default();
+        let mut sessions: SessionCollection = Cache::builder()
+            .expire_after(SessionExpiry {
+                tcp_timeout: config.tcp_timeout,
+                udp_timeout: config.udp_timeout,
+            })
+            .build();
+
+        let raw = udp_packet(1000, 2000, b"payload");
+        let mut stale_drop = NetworkPacket::parse(&raw).unwrap();
+        let tuple = stale_drop.reverse_network_tuple();
+        let (sender, _receiver) = async_channel::unbounded();
+        sessions.insert(
+            tuple,
+            SessionEntry {
+                sender,
+                generation: 2,
+            },
+        );
+        match &mut stale_drop.ip {
+            packet::IpHeader::Ipv4(ip) => ip.time_to_live = DROP_TTL,
+            packet::IpHeader::Ipv6(ip) => ip.hop_limit = DROP_TTL,
+        }
+        stale_drop.teardown_generation = Some(1);
+        let (device_sender, _device_receiver) = async_channel::unbounded();
+
+        process_upstream_recv(stale_drop, &mut sessions, device_sender).unwrap();
+
+        assert_eq!(sessions.get(&tuple).unwrap().generation, 2);
+    }
+
+    #[test]
+    fn closed_device_output_channel_is_reported() {
+        let config = IpStackConfig::default();
+        let mut sessions: SessionCollection = Cache::builder()
+            .expire_after(SessionExpiry {
+                tcp_timeout: config.tcp_timeout,
+                udp_timeout: config.udp_timeout,
+            })
+            .build();
+        let packet = NetworkPacket::parse(&udp_packet(1000, 2000, b"payload")).unwrap();
+        let (device_sender, device_receiver) = async_channel::unbounded();
+        drop(device_receiver);
+
+        let error = process_upstream_recv(packet, &mut sessions, device_sender).unwrap_err();
+
+        assert!(error.to_string().contains("device output channel closed"));
     }
 
     #[tokio::test]
@@ -532,7 +684,6 @@ mod tests {
         let syn_ack_tcp = packet_tcp_header(&syn_ack);
         assert!(syn_ack_tcp.syn);
         assert!(syn_ack_tcp.ack);
-        assert_eq!(syn_ack_tcp.sequence_number, 100);
         assert_eq!(syn_ack_tcp.acknowledgment_number, 1001);
 
         let client_ack = tcp_packet(

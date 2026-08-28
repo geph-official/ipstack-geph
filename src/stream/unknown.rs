@@ -85,6 +85,7 @@ impl IpStackUnknownTransport {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Unknown,
                     payload: p,
+                    teardown_generation: None,
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -111,6 +112,7 @@ impl IpStackUnknownTransport {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Unknown,
                     payload: p,
+                    teardown_generation: None,
                 })
             }
             _ => unreachable!(),
