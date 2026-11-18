@@ -1,11 +1,11 @@
 use tokio::time::{sleep_until, Instant as TokioInstant, Sleep};
 
-use crate::packet::TcpHeaderWrapper;
+use crate::packet::tcp_flags::{ACK, PSH};
 use std::{collections::BTreeMap, future::Future, pin::Pin, time::Duration};
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const MAX_INFLIGHT_SEGMENTS: usize = 16;
-const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 const RTO: Duration = Duration::from_millis(100);
 // Exponential backoff for the RTO timer. Without backoff, a peer that never
 // ACKs (e.g. its socket vanished and the RST never reached us) is retransmitted
@@ -23,30 +23,16 @@ const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
     Established,
-    FinWait1(bool),
-    FinWait2(bool), // bool means waiting for ack
     Closed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum PacketStatus {
-    WindowUpdate,
-    Invalid,
-    RetransmissionRequest,
-    NewPacket,
-    Ack,
-    KeepAlive,
 }
 
 #[derive(Debug)]
 pub(super) struct Tcb {
     seq: u32,
-    pub(super) retransmission: Option<u32>,
     ack: u32,
     last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
     tcp_timeout: Duration,
-    recv_window: u16,
     send_window: u16,
     state: TcpState,
     pub(super) inflight_packets: Vec<InflightPacket>,
@@ -74,13 +60,11 @@ impl Tcb {
         let deadline = TokioInstant::now() + tcp_timeout;
         Tcb {
             seq,
-            retransmission: None,
             ack,
             last_ack: seq,
             tcp_timeout,
             timeout: Box::pin(sleep_until(deadline)),
             send_window: u16::MAX,
-            recv_window: 0,
             state: TcpState::SynReceived(false),
             inflight_packets: Vec::new(),
             unordered_packets: BTreeMap::new(),
@@ -92,38 +76,78 @@ impl Tcb {
         }
     }
     pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
+        self.track_segment(InflightPacket {
+            seq,
+            flags: PSH | ACK,
+            payload: buf,
+        });
+    }
+
+    pub(super) fn add_control(&mut self, flags: u8) {
+        self.track_segment(InflightPacket {
+            seq: self.seq,
+            flags,
+            payload: Vec::new(),
+        });
+    }
+
+    fn track_segment(&mut self, segment: InflightPacket) {
         let was_empty = self.inflight_packets.is_empty();
-        let buf_len = buf.len() as u32;
-        self.inflight_packets.push(InflightPacket::new(seq, buf));
-        self.seq = self.seq.wrapping_add(buf_len);
-        if was_empty && buf_len > 0 {
+        self.seq = self.seq.wrapping_add(segment.sequence_len());
+        self.inflight_packets.push(segment);
+        if was_empty {
             self.reset_rto_backoff();
             self.arm_rto();
         }
     }
-    pub(super) fn add_unordered_packet(&mut self, seq: u32, buf: Vec<u8>) {
+
+    pub(super) fn add_unordered_packet(&mut self, mut seq: u32, mut buf: Vec<u8>) {
         if seq_before(seq, self.ack) {
+            let consumed = self.ack.wrapping_sub(seq) as usize;
+            if consumed >= buf.len() {
+                return;
+            }
+            buf.drain(..consumed);
+            seq = self.ack;
+        }
+        let start = seq.wrapping_sub(self.ack) as usize;
+        buf.truncate(READ_BUFFER_SIZE.saturating_sub(start));
+        if buf.is_empty() {
             return;
         }
+        let end = start + buf.len();
+        let ack = self.ack;
+
+        // Keep stored ranges disjoint. When a segment overlaps a buffered
+        // segment, retain the portions of the old segment outside the new one.
+        let mut ends = Vec::new();
+        self.unordered_packets.retain(|&old_seq, old| {
+            let old_start = old_seq.wrapping_sub(ack) as usize;
+            let old_end = old_start + old.payload.len();
+            if old_end <= start || end <= old_start {
+                return true;
+            }
+            if old_end > end {
+                ends.push((
+                    ack.wrapping_add(end as u32),
+                    old.payload.split_off(end - old_start),
+                ));
+            }
+            if old_start < start {
+                old.payload.truncate(start - old_start);
+                return true;
+            }
+            false
+        });
+        self.unordered_packets.extend(
+            ends.into_iter()
+                .map(|(seq, payload)| (seq, UnorderedPacket::new(payload))),
+        );
         self.unordered_packets
             .insert(seq, UnorderedPacket::new(buf));
     }
-    pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(
-            self.unordered_packets
-                .iter()
-                .fold(0, |acc, (_, p)| acc + p.payload.len()),
-        )
-    }
     pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
-        // dbg!(self.ack);
-        // for (seq,_) in self.unordered_packets.iter() {
-        //     dbg!(seq);
-        // }
         self.unordered_packets.remove(&self.ack).map(|p| p.payload)
-    }
-    pub(super) fn add_seq_one(&mut self) {
-        self.seq = self.seq.wrapping_add(1);
     }
     pub(super) fn get_seq(&self) -> u32 {
         self.seq
@@ -151,85 +175,38 @@ impl Tcb {
         self.send_window
             .saturating_sub(bytes_in_flight.min(u16::MAX as u32) as u16)
     }
-    pub(super) fn change_recv_window(&mut self, window: u16) {
-        self.recv_window = window;
+    pub(super) fn is_old_ack(&self, ack: u32) -> bool {
+        seq_before(ack, self.last_ack)
     }
-    pub(super) fn get_recv_window(&self) -> u16 {
-        self.recv_window
-    }
-    // #[inline(always)]
-    // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
-    //     match MAX_UNACK - self.inflight_packets.len() as u32 {
-    //         // b if b.saturating_sub(payload_len as u32 + 64) != 0 => payload_len,
-    //         // b if b < 128 && b >= 4 => (b / 2) as u16,
-    //         // b if b < 4 => b as u16,
-    //         // b => (b - 64) as u16,
-    //         b if b >= payload_len as u32 * 2 && b > 0 => payload_len,
-    //         b if b < 4 => b as u16,
-    //         b => (b / 2) as u16,
-    //     }
-    // }
 
-    pub(super) fn check_pkt_type(&self, header: &TcpHeaderWrapper, p: &[u8]) -> PacketStatus {
-        let tcp_header = header.inner();
-        let packet_ack = tcp_header.acknowledgment_number;
-
-        if seq_before(packet_ack, self.last_ack) || seq_after(packet_ack, self.seq) {
-            PacketStatus::Invalid
-        } else if self.last_ack == packet_ack {
-            if !p.is_empty() {
-                PacketStatus::NewPacket
-            } else if self.send_window == tcp_header.window_size && self.seq != self.last_ack {
-                PacketStatus::RetransmissionRequest
-            } else if self.ack.wrapping_sub(1) == tcp_header.sequence_number {
-                PacketStatus::KeepAlive
-            } else {
-                PacketStatus::WindowUpdate
-            }
-        } else if seq_after(packet_ack, self.last_ack) {
-            if !p.is_empty() {
-                PacketStatus::NewPacket
-            } else {
-                PacketStatus::Ack
-            }
-        } else {
-            PacketStatus::Invalid
-        }
+    pub(super) fn valid_ack(&self, ack: u32) -> bool {
+        seq_lte(self.last_ack, ack) && seq_lte(ack, self.seq)
     }
+
     pub(super) fn change_last_ack(&mut self, ack: u32) {
-        if seq_before(ack, self.last_ack) || seq_after(ack, self.seq) {
+        if !seq_after(ack, self.last_ack) || seq_after(ack, self.seq) {
             return;
         }
-        let advanced = seq_after(ack, self.last_ack);
         self.last_ack = ack;
 
-        if self.state == TcpState::Established {
-            if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
-                let mut inflight_packet = self.inflight_packets.remove(i);
-                tracing::trace!("packet {} is acked", inflight_packet.seq);
-                let distance = ack.wrapping_sub(inflight_packet.seq) as usize;
-                if distance < inflight_packet.payload.len() {
-                    inflight_packet.payload.drain(0..distance);
-                    inflight_packet.seq = ack;
-                    self.inflight_packets.insert(i, inflight_packet);
-                }
+        self.inflight_packets.retain_mut(|segment| {
+            let end = segment.seq.wrapping_add(segment.sequence_len());
+            if !seq_after(end, ack) {
+                return false;
             }
-            self.inflight_packets.retain(|p| {
-                let last_byte = p.seq.wrapping_add(p.payload.len() as u32);
-                seq_after(last_byte, self.last_ack)
-            });
-            if self.inflight_packets.is_empty() {
-                self.disarm_rto();
-            } else if advanced {
-                // Forward ACK progress: the peer is alive and consuming, so
-                // restart the retransmission clock from scratch. Packets that
-                // merely repeat the same ACK deliberately do NOT re-arm the
-                // timer — that would let a peer that talks without ever
-                // ACKing postpone retransmission (and the give-up below)
-                // forever.
-                self.reset_rto_backoff();
-                self.arm_rto();
+            if seq_before(segment.seq, ack) {
+                segment
+                    .payload
+                    .drain(..ack.wrapping_sub(segment.seq) as usize);
+                segment.seq = ack;
             }
+            true
+        });
+        if self.inflight_packets.is_empty() {
+            self.disarm_rto();
+        } else {
+            self.reset_rto_backoff();
+            self.arm_rto();
         }
     }
     pub fn is_send_buffer_full(&self) -> bool {
@@ -238,7 +215,7 @@ impl Tcb {
     }
 
     pub(super) fn record_fin(&mut self, sequence_number: u32) {
-        if !seq_before(sequence_number, self.ack) {
+        if sequence_number.wrapping_sub(self.ack) as usize <= READ_BUFFER_SIZE {
             self.pending_fin = Some(sequence_number);
         }
     }
@@ -310,20 +287,17 @@ impl Tcb {
 #[derive(Debug)]
 pub struct InflightPacket {
     pub seq: u32,
+    pub flags: u8,
     pub payload: Vec<u8>,
-    // pub send_time: SystemTime, // todo
 }
 
 impl InflightPacket {
-    fn new(seq: u32, payload: Vec<u8>) -> Self {
-        Self {
-            seq,
-            payload,
-            // send_time: SystemTime::now(), // todo
+    fn sequence_len(&self) -> u32 {
+        if self.payload.is_empty() {
+            1
+        } else {
+            self.payload.len() as u32
         }
-    }
-    pub(crate) fn contains(&self, seq: u32) -> bool {
-        seq_after(seq, self.seq) && seq_lte(seq, self.seq.wrapping_add(self.payload.len() as u32))
     }
 }
 

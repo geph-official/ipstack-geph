@@ -8,9 +8,6 @@ pub struct NetworkTuple {
     pub tcp: bool,
 }
 pub mod tcp_flags {
-    pub const CWR: u8 = 0b10000000;
-    pub const ECE: u8 = 0b01000000;
-    pub const URG: u8 = 0b00100000;
     pub const ACK: u8 = 0b00010000;
     pub const PSH: u8 = 0b00001000;
     pub const RST: u8 = 0b00000100;
@@ -36,7 +33,10 @@ pub(crate) enum IpHeader {
 pub(crate) enum TransportHeader {
     Tcp(TcpHeader),
     Udp(UdpHeader),
-    Unknown,
+    Unknown {
+        protocol: etherparse::IpNumber,
+        fragmented: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -44,23 +44,27 @@ pub struct NetworkPacket {
     pub(crate) ip: IpHeader,
     pub(crate) transport: TransportHeader,
     pub(crate) payload: Vec<u8>,
-    // Internal-only identity used by TCP teardown notifications. This is never
-    // serialized onto the wire, and parsed device packets never carry one.
-    pub(crate) teardown_generation: Option<u64>,
+    pub(crate) extensions: Vec<u8>,
+    // Only locally generated packets from accepted streams carry this identity.
+    pub(crate) session_generation: Option<u64>,
 }
 impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> anyhow::Result<Self> {
         let p = SlicedPacket::from_ip(buf).map_err(|_| anyhow::anyhow!("InvalidPacket"))?;
         let ip = p.net.ok_or_else(|| anyhow::anyhow!("InvalidPacket"))?;
 
-        let (ip, ip_payload) = match ip {
+        let (ip, ip_payload, extensions) = match ip {
             NetSlice::Ipv4(ip) => (
                 IpHeader::Ipv4(ip.header().to_header()),
-                ip.payload().payload,
+                ip.payload().clone(),
+                ip.extensions()
+                    .auth
+                    .map_or_else(Vec::new, |auth| auth.slice().to_vec()),
             ),
             NetSlice::Ipv6(ip) => (
                 IpHeader::Ipv6(ip.header().to_header()),
-                ip.payload().payload,
+                ip.payload().clone(),
+                ip.extensions().slice().to_vec(),
             ),
         };
         let (transport, payload) = match p.transport {
@@ -70,7 +74,13 @@ impl NetworkPacket {
             Some(etherparse::TransportSlice::Udp(u)) => {
                 (TransportHeader::Udp(u.to_header()), u.payload())
             }
-            _ => (TransportHeader::Unknown, ip_payload),
+            _ => (
+                TransportHeader::Unknown {
+                    protocol: ip_payload.ip_number,
+                    fragmented: ip_payload.fragmented,
+                },
+                ip_payload.payload,
+            ),
         };
         let payload = payload.to_vec();
 
@@ -78,7 +88,8 @@ impl NetworkPacket {
             ip,
             transport,
             payload,
-            teardown_generation: None,
+            extensions,
+            session_generation: None,
         })
     }
     pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {
@@ -130,6 +141,7 @@ impl NetworkPacket {
             IpHeader::Ipv4(ref ip) => ip.write(&mut buf)?,
             IpHeader::Ipv6(ref ip) => ip.write(&mut buf)?,
         }
+        buf.extend_from_slice(&self.extensions);
         match self.transport {
             TransportHeader::Tcp(ref h) => h.write(&mut buf)?,
             TransportHeader::Udp(ref h) => h.write(&mut buf)?,
@@ -153,36 +165,6 @@ pub(super) struct TcpHeaderWrapper {
 impl TcpHeaderWrapper {
     pub fn inner(&self) -> &TcpHeader {
         &self.header
-    }
-    pub fn flags(&self) -> u8 {
-        let inner = self.inner();
-        let mut flags = 0;
-        if inner.cwr {
-            flags |= tcp_flags::CWR;
-        }
-        if inner.ece {
-            flags |= tcp_flags::ECE;
-        }
-        if inner.urg {
-            flags |= tcp_flags::URG;
-        }
-        if inner.ack {
-            flags |= tcp_flags::ACK;
-        }
-        if inner.psh {
-            flags |= tcp_flags::PSH;
-        }
-        if inner.rst {
-            flags |= tcp_flags::RST;
-        }
-        if inner.syn {
-            flags |= tcp_flags::SYN;
-        }
-        if inner.fin {
-            flags |= tcp_flags::FIN;
-        }
-
-        flags
     }
 }
 
@@ -261,6 +243,27 @@ pub mod tests {
                 })
             });
         }
+    }
+
+    #[test]
+    fn ipv6_extension_round_trips_and_preserves_the_inner_protocol() {
+        let mut raw = vec![0u8; 40];
+        raw[0] = 0x60;
+        raw[4..6].copy_from_slice(&12u16.to_be_bytes());
+        raw[6] = etherparse::IpNumber::IPV6_HEADER_HOP_BY_HOP.0;
+        raw[7] = 64;
+        raw.extend_from_slice(&[47, 0, 0, 0, 0, 0, 0, 0]);
+        raw.extend_from_slice(&[1, 2, 3, 4]);
+        let parsed = NetworkPacket::parse(&raw).unwrap();
+        assert!(matches!(
+            parsed.transport,
+            TransportHeader::Unknown {
+                protocol: etherparse::IpNumber(47),
+                fragmented: false
+            }
+        ));
+        assert_eq!(parsed.payload, [1, 2, 3, 4]);
+        assert_eq!(parsed.to_bytes().unwrap(), raw);
     }
 
     #[test]

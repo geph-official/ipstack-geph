@@ -7,7 +7,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 
+use parking_lot::Mutex;
 use std::{net::SocketAddr, pin::Pin, time::Duration};
+use tokio::time::{timeout_at, Instant};
 
 #[derive(Debug)]
 pub struct IpStackUdpStream {
@@ -18,6 +20,8 @@ pub struct IpStackUdpStream {
     pkt_sender: PacketSender,
 
     udp_timeout: Duration,
+    last_activity: Mutex<Instant>,
+    session_generation: Option<u64>,
     mtu: u16,
 }
 
@@ -40,25 +44,43 @@ impl IpStackUdpStream {
             pkt_sender,
 
             udp_timeout,
+            last_activity: Mutex::new(Instant::now()),
+            session_generation: None,
             mtu,
         }
     }
 
+    pub(crate) fn with_session_generation(mut self, generation: u64) -> Self {
+        self.session_generation = Some(generation);
+        self
+    }
+
     pub async fn recv(&self) -> anyhow::Result<Bytes> {
-        Ok(
-            tokio::time::timeout(self.udp_timeout, self.stream_receiver.recv())
-                .await
-                .context("timeout")??
-                .payload
-                .into(),
-        )
+        loop {
+            anyhow::ensure!(!self.stream_receiver.is_closed(), "UDP session closed");
+            let deadline = *self.last_activity.lock() + self.udp_timeout;
+            match timeout_at(deadline, self.stream_receiver.recv()).await {
+                Ok(packet) => {
+                    let packet = packet?;
+                    *self.last_activity.lock() = Instant::now();
+                    return Ok(packet.payload.into());
+                }
+                Err(error) => {
+                    if Instant::now() >= *self.last_activity.lock() + self.udp_timeout {
+                        return Err(error).context("timeout");
+                    }
+                }
+            }
+        }
     }
 
     pub async fn send(&self, bts: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.stream_receiver.is_closed(), "UDP session closed");
         let packet = self
             .create_rev_packet(TTL, bts.to_vec())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.pkt_sender.send(packet).await?;
+        *self.last_activity.lock() = Instant::now();
         Ok(())
     }
 
@@ -89,7 +111,8 @@ impl IpStackUdpStream {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
-                    teardown_generation: None,
+                    extensions: Vec::new(),
+                    session_generation: self.session_generation,
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -122,7 +145,8 @@ impl IpStackUdpStream {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
-                    teardown_generation: None,
+                    extensions: Vec::new(),
+                    session_generation: self.session_generation,
                 })
             }
             _ => unreachable!(),
@@ -145,6 +169,30 @@ mod tests {
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         time::Duration,
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn receive_deadline_counts_outgoing_packets_as_activity() {
+        let (sender, _receiver) = async_channel::unbounded();
+        let stream = IpStackUdpStream::new(
+            "127.0.0.1:1234".parse().unwrap(),
+            "127.0.0.1:2345".parse().unwrap(),
+            sender,
+            1500,
+            Duration::from_secs(5),
+        );
+        let mut receive = std::pin::pin!(stream.recv());
+        assert!(futures_lite::future::poll_once(receive.as_mut())
+            .await
+            .is_none());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        stream.send(b"still active").await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(futures_lite::future::poll_once(receive.as_mut())
+            .await
+            .is_none());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(receive.await.is_err());
+    }
 
     #[test]
     fn oversized_udp_datagram_returns_error() {

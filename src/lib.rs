@@ -6,7 +6,7 @@ use async_channel::{Receiver, Sender, TrySendError};
 use bytes::Bytes;
 use log::trace;
 use moka::{sync::Cache, Expiry};
-use packet::{NetworkPacket, NetworkTuple};
+use packet::{NetworkPacket, NetworkTuple, TransportHeader};
 use parking_lot::Mutex;
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -32,6 +32,8 @@ const DROP_TTL: u8 = 0;
 const TTL: u8 = 64;
 
 const ACCEPT_QUEUE_CAPACITY: usize = 1024;
+const EGRESS_QUEUE_CAPACITY: usize = 4096;
+const PACKET_BATCH: usize = 64;
 const MAX_SESSIONS: u64 = 65_536;
 static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -92,48 +94,77 @@ async fn run(
     send_packet: Sender<Bytes>,
     accept_sender: Sender<IpStackStream>,
 ) -> anyhow::Result<()> {
-    let sessions: SessionCollection = Cache::builder()
-        .max_capacity(MAX_SESSIONS)
-        .expire_after(SessionExpiry {
-            tcp_timeout: config.tcp_timeout,
-            udp_timeout: config.udp_timeout,
-        })
-        .build();
+    let sessions = LiveSessions(
+        Cache::builder()
+            .max_capacity(MAX_SESSIONS)
+            .expire_after(SessionExpiry {
+                tcp_timeout: config.tcp_timeout,
+                udp_timeout: config.udp_timeout,
+            })
+            .eviction_listener(|_, entry: SessionEntry, _| {
+                entry.sender.close();
+            })
+            .build(),
+    );
     let sessions = Mutex::new(sessions);
-
-    let (pkt_sender, pkt_receiver) = async_channel::unbounded::<NetworkPacket>();
+    let (pkt_sender, pkt_receiver) = async_channel::bounded::<NetworkPacket>(EGRESS_QUEUE_CAPACITY);
 
     let accept_loop = async {
         loop {
-            let packet = recv_packet.recv().await?;
-            let mut sessions = sessions.lock();
-            if let Some(stream) =
-                process_device_read(&packet, &mut sessions, pkt_sender.clone(), &config)
-            {
-                match accept_sender.try_send(stream) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(stream)) => {
-                        remove_stream_session(&stream, &mut sessions);
-                        trace!("dropping new stream because the accept queue is full");
-                    }
-                    Err(TrySendError::Closed(stream)) => {
-                        remove_stream_session(&stream, &mut sessions);
-                        anyhow::bail!("accept channel closed");
+            for _ in 0..PACKET_BATCH {
+                let packet = recv_packet.recv().await?;
+                let mut sessions = sessions.lock();
+                if let Some(stream) =
+                    process_device_read(&packet, &mut sessions.0, pkt_sender.clone(), &config)
+                {
+                    match accept_sender.try_send(stream) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(stream)) => {
+                            remove_stream_session(&stream, &mut sessions.0);
+                            trace!("dropping new stream because the accept queue is full");
+                        }
+                        Err(TrySendError::Closed(stream)) => {
+                            remove_stream_session(&stream, &mut sessions.0);
+                            anyhow::bail!("accept channel closed");
+                        }
                     }
                 }
             }
+            tokio::task::yield_now().await;
         }
     };
 
     let inject_loop = async {
         loop {
-            let packet = pkt_receiver.recv().await?;
-            let mut sessions = sessions.lock();
-            process_upstream_recv(packet, &mut sessions, send_packet.clone())?;
+            for _ in 0..PACKET_BATCH {
+                let packet = pkt_receiver.recv().await?;
+                process_upstream_recv(packet, &mut sessions.lock().0, send_packet.clone())?;
+            }
+            tokio::task::yield_now().await;
         }
     };
 
-    futures_lite::future::race(accept_loop, inject_loop).await
+    let maintenance_loop = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sessions.lock().0.run_pending_tasks();
+        }
+    };
+
+    futures_lite::future::race(
+        futures_lite::future::race(accept_loop, inject_loop),
+        maintenance_loop,
+    )
+    .await
+}
+
+struct LiveSessions(SessionCollection);
+
+impl Drop for LiveSessions {
+    fn drop(&mut self) {
+        self.0.invalidate_all();
+        self.0.run_pending_tasks();
+    }
 }
 
 struct SessionExpiry {
@@ -187,13 +218,20 @@ fn process_device_read(
         return Some(IpStackStream::UnknownNetwork(data.to_owned()));
     };
 
-    if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
+    if let TransportHeader::Unknown {
+        protocol,
+        fragmented,
+    } = packet.transport
+    {
+        if fragmented {
+            return None;
+        }
         return Some(IpStackStream::UnknownTransport(
             IpStackUnknownTransport::new(
                 packet.src_addr().ip(),
                 packet.dst_addr().ip(),
                 packet.payload,
-                &packet.ip,
+                protocol,
                 config.mtu,
                 pkt_sender,
             ),
@@ -265,7 +303,8 @@ fn create_stream(
                 config.mtu,
                 config.udp_timeout,
             );
-            let _ = stream.stream_sender().try_send(packet.clone());
+            let stream = stream.with_session_generation(session_generation);
+            let _ = stream.stream_sender().try_send(packet);
             Some((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
         IpStackPacketProtocol::Unknown => {
@@ -279,19 +318,23 @@ fn process_upstream_recv(
     sessions: &mut SessionCollection,
     device: Sender<Bytes>,
 ) -> anyhow::Result<()> {
-    if packet.ttl() == 0 {
+    if let Some(generation) = packet.session_generation {
         let tuple = packet.reverse_network_tuple();
-        if let (Some(generation), Some(session)) =
-            (packet.teardown_generation, sessions.get(&tuple))
-        {
-            if session.generation == generation {
-                sessions.remove(&tuple);
-            }
+        let Some(session) = sessions.get(&tuple) else {
+            return Ok(());
+        };
+        if session.generation != generation {
+            return Ok(());
         }
+        if packet.ttl() == DROP_TTL {
+            session.sender.close();
+            sessions.invalidate(&tuple);
+            return Ok(());
+        }
+    } else if packet.ttl() == DROP_TTL {
         return Ok(());
     }
-    #[allow(unused_mut)]
-    let Ok(mut packet_bytes) = packet.to_bytes() else {
+    let Ok(packet_bytes) = packet.to_bytes() else {
         trace!("to_bytes error");
         return Ok(());
     };
@@ -321,7 +364,9 @@ fn remove_stream_session(stream: &IpStackStream, sessions: &mut SessionCollectio
         IpStackStream::UnknownTransport(_) | IpStackStream::UnknownNetwork(_) => None,
     };
     if let Some(tuple) = tuple {
-        sessions.remove(&tuple);
+        if let Some(session) = sessions.remove(&tuple) {
+            session.sender.close();
+        }
     }
 }
 
@@ -386,7 +431,8 @@ mod tests {
             ip: IpHeader::Ipv4(ip),
             transport: TransportHeader::Tcp(tcp),
             payload: payload.to_vec(),
-            teardown_generation: None,
+            extensions: Vec::new(),
+            session_generation: None,
         }
         .to_bytes()
         .unwrap()
@@ -591,7 +637,7 @@ mod tests {
             packet::IpHeader::Ipv4(ip) => ip.time_to_live = DROP_TTL,
             packet::IpHeader::Ipv6(ip) => ip.hop_limit = DROP_TTL,
         }
-        drop_packet.teardown_generation = Some(1);
+        drop_packet.session_generation = Some(1);
         let (device_sender, _device_receiver) = async_channel::unbounded();
 
         process_upstream_recv(drop_packet, &mut sessions, device_sender).unwrap();
@@ -623,12 +669,54 @@ mod tests {
             packet::IpHeader::Ipv4(ip) => ip.time_to_live = DROP_TTL,
             packet::IpHeader::Ipv6(ip) => ip.hop_limit = DROP_TTL,
         }
-        stale_drop.teardown_generation = Some(1);
+        stale_drop.session_generation = Some(1);
         let (device_sender, _device_receiver) = async_channel::unbounded();
 
         process_upstream_recv(stale_drop, &mut sessions, device_sender).unwrap();
 
         assert_eq!(sessions.get(&tuple).unwrap().generation, 2);
+    }
+
+    #[test]
+    fn replacing_a_session_rejects_queued_packets_from_the_previous_stream() {
+        let mut sessions: SessionCollection = Cache::new(8);
+        let (sender, receiver) = async_channel::unbounded();
+        let mut reply = NetworkPacket::parse(&udp_packet(2000, 1000, b"reply")).unwrap();
+        sessions.insert(
+            reply.reverse_network_tuple(),
+            SessionEntry {
+                sender,
+                generation: 2,
+            },
+        );
+        let (device, output) = async_channel::unbounded();
+        reply.session_generation = Some(1);
+        process_upstream_recv(reply.clone(), &mut sessions, device.clone()).unwrap();
+        assert!(output.is_empty());
+
+        // A final packet queued before the stream was dropped remains valid.
+        drop(receiver);
+        reply.session_generation = Some(2);
+        process_upstream_recv(reply, &mut sessions, device).unwrap();
+        assert!(output.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_stack_closes_an_accepted_udp_stream() {
+        let (input, capture) = async_channel::bounded(1);
+        let (inject, _output) = async_channel::bounded(1);
+        let stack = IpStack::new(IpStackConfig::default(), capture, inject);
+        input
+            .send(udp_packet(1000, 2000, b"hello").into())
+            .await
+            .unwrap();
+        let IpStackStream::Udp(stream) = stack.accept().await.unwrap() else {
+            panic!("expected UDP stream");
+        };
+        assert_eq!(stream.recv().await.unwrap().as_ref(), b"hello");
+        drop(stack);
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.recv()).await;
+        assert!(matches!(result, Ok(Err(_))));
     }
 
     #[test]
@@ -649,8 +737,8 @@ mod tests {
         assert!(error.to_string().contains("device output channel closed"));
     }
 
-    #[tokio::test]
-    async fn tcp_happy_path_handshake_write_ack_and_read_payload() {
+    #[tokio::test(start_paused = true)]
+    async fn tcp_write_first_recovers_lost_syn_ack_and_delivers_third_packet_payload() {
         let config = IpStackConfig {
             mtu: 1500,
             tcp_timeout: Duration::from_secs(60),
@@ -672,13 +760,10 @@ mod tests {
         };
         let mut stream = Box::pin(stream);
 
-        let mut empty = [];
-        let first_read = poll_once(poll_fn(|cx| {
-            let mut rb = ReadBuf::new(&mut empty);
-            stream.as_mut().poll_read(cx, &mut rb)
-        }))
-        .await;
-        assert!(first_read.is_none());
+        let mut empty = [0];
+        let first_write =
+            poll_once(poll_fn(|cx| stream.as_mut().poll_write(cx, b"server-data"))).await;
+        assert!(first_write.is_none());
 
         let syn_ack = packet_receiver.try_recv().unwrap();
         let syn_ack_tcp = packet_tcp_header(&syn_ack);
@@ -686,25 +771,27 @@ mod tests {
         assert!(syn_ack_tcp.ack);
         assert_eq!(syn_ack_tcp.acknowledgment_number, 1001);
 
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert!(
+            poll_once(poll_fn(|cx| stream.as_mut().poll_write(cx, b"server-data")))
+                .await
+                .is_none()
+        );
+        let retry = packet_receiver.try_recv().unwrap();
+        assert_eq!(packet_tcp_header(&retry), syn_ack_tcp);
+
         let client_ack = tcp_packet(
             1000,
             2000,
             1001,
             Some(syn_ack_tcp.sequence_number + 1),
             tcp_flags::ACK,
-            &[],
+            b"first",
         );
         assert!(
             process_device_read(&client_ack, &mut sessions, packet_sender.clone(), &config)
                 .is_none()
         );
-        let establish = poll_once(poll_fn(|cx| {
-            let mut rb = ReadBuf::new(&mut empty);
-            stream.as_mut().poll_read(cx, &mut rb)
-        }))
-        .await;
-        assert!(establish.is_none());
-
         let written = poll_fn(|cx| stream.as_mut().poll_write(cx, b"server-data"))
             .await
             .unwrap();
@@ -716,9 +803,20 @@ mod tests {
         assert!(outbound_tcp.ack);
         assert_eq!(outbound.payload, b"server-data");
 
-        let server_next_seq = outbound_tcp.sequence_number + outbound.payload.len() as u32;
+        let server_next_seq = outbound_tcp
+            .sequence_number
+            .wrapping_add(outbound.payload.len() as u32);
+        let mut initial_data = [0; 5];
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.read_exact(&mut initial_data).await.unwrap();
+        assert_eq!(&initial_data, b"first");
+        assert_eq!(
+            packet_tcp_header(&packet_receiver.try_recv().unwrap()).acknowledgment_number,
+            1006
+        );
+
         let ack_server_data =
-            tcp_packet(1000, 2000, 1001, Some(server_next_seq), tcp_flags::ACK, &[]);
+            tcp_packet(1000, 2000, 1006, Some(server_next_seq), tcp_flags::ACK, &[]);
         assert!(process_device_read(
             &ack_server_data,
             &mut sessions,
@@ -726,22 +824,28 @@ mod tests {
             &config
         )
         .is_none());
-        let ack_poll = poll_once(poll_fn(|cx| {
-            let mut rb = ReadBuf::new(&mut empty);
-            stream.as_mut().poll_read(cx, &mut rb)
-        }))
-        .await;
-        assert!(ack_poll.is_none());
+
+        // A local shutdown sends FIN, but still permits reading peer data.
+        assert!(poll_once(stream.shutdown()).await.is_none());
+        let fin = packet_receiver.try_recv().unwrap();
+        assert!(packet_tcp_header(&fin).fin);
+        assert!(poll_once(stream.read(&mut empty)).await.is_none());
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert!(poll_once(stream.shutdown()).await.is_none());
+        let retry = packet_receiver.try_recv().unwrap();
+        assert_eq!(packet_tcp_header(&retry), packet_tcp_header(&fin));
 
         let inbound = tcp_packet(
             1000,
             2000,
-            1001,
-            Some(server_next_seq),
+            1006,
+            Some(server_next_seq.wrapping_add(1)),
             tcp_flags::PSH | tcp_flags::ACK,
             b"client-data",
         );
-        assert!(process_device_read(&inbound, &mut sessions, packet_sender, &config).is_none());
+        assert!(
+            process_device_read(&inbound, &mut sessions, packet_sender.clone(), &config).is_none()
+        );
 
         let mut read_buf = [0; 32];
         let read = poll_fn(|cx| {
@@ -761,7 +865,38 @@ mod tests {
         assert!(data_ack_tcp.ack);
         assert_eq!(
             data_ack_tcp.acknowledgment_number,
-            1001 + b"client-data".len() as u32
+            1006 + b"client-data".len() as u32
         );
+
+        let end = data_ack_tcp.acknowledgment_number;
+        let duplicate = tcp_packet(
+            1000,
+            2000,
+            1006,
+            Some(server_next_seq.wrapping_add(1)),
+            tcp_flags::ACK,
+            b"client-data",
+        );
+        assert!(
+            process_device_read(&duplicate, &mut sessions, packet_sender.clone(), &config)
+                .is_none()
+        );
+        assert!(poll_once(stream.read(&mut read_buf)).await.is_none());
+        assert_eq!(
+            packet_tcp_header(&packet_receiver.try_recv().unwrap()).acknowledgment_number,
+            end
+        );
+
+        let overlap = tcp_packet(
+            1000,
+            2000,
+            end.wrapping_sub(4),
+            Some(server_next_seq.wrapping_add(1)),
+            tcp_flags::ACK,
+            b"data and more",
+        );
+        assert!(process_device_read(&overlap, &mut sessions, packet_sender, &config).is_none());
+        let n = stream.read(&mut read_buf).await.unwrap();
+        assert_eq!(&read_buf[..n], b" and more");
     }
 }
