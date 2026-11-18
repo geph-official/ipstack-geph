@@ -7,7 +7,7 @@ use crate::{
     PacketReceiver, PacketSender, DROP_TTL, TTL,
 };
 
-use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpOptionElement};
 use futures_lite::StreamExt;
 use log::{error, trace, warn};
 use std::{
@@ -49,6 +49,7 @@ pub(crate) struct IpStackTcpStream {
     packet_to_send: Option<NetworkPacket>,
     tcb: Tcb,
     mtu: u16,
+    peer_mss: u16,
     shutdown: Shutdown,
     write_notify: Option<Waker>,
     session_generation: u64,
@@ -64,6 +65,17 @@ impl IpStackTcpStream {
         mtu: u16,
         tcp_timeout: Duration,
     ) -> anyhow::Result<IpStackTcpStream> {
+        // RFC 9293 section 3.7.1: MSS limits TCP data, not the IP packet.
+        // The virtual interface's MTU can exceed the peer's actual link MTU.
+        let peer_mss = tcp
+            .inner()
+            .options_iterator()
+            .find_map(|option| match option {
+                Ok(TcpOptionElement::MaximumSegmentSize(mss)) => Some(mss),
+                _ => None,
+            })
+            .unwrap_or(if src_addr.is_ipv4() { 536 } else { 1220 });
+        anyhow::ensure!(peer_mss > 0, "TCP peer advertised a zero MSS");
         let stream = IpStackTcpStream {
             src_addr,
             dst_addr,
@@ -72,6 +84,7 @@ impl IpStackTcpStream {
             packet_to_send: None,
             tcb: Tcb::new(tcp.inner().sequence_number + 1, tcp_timeout),
             mtu,
+            peer_mss,
             shutdown: Shutdown::None,
             write_notify: None,
             session_generation: 0,
@@ -112,9 +125,15 @@ impl IpStackTcpStream {
     }
 
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
+        let fixed_ip_header_size = if self.src_addr.is_ipv4() { 20 } else { 40 };
+        let option_size = ip_header_size.saturating_sub(fixed_ip_header_size)
+            + tcp_header_size.saturating_sub(20);
         cmp::min(
             self.tcb.get_available_send_window(),
-            self.mtu.saturating_sub(ip_header_size + tcp_header_size),
+            cmp::min(
+                self.mtu.saturating_sub(ip_header_size + tcp_header_size),
+                self.peer_mss.saturating_sub(option_size),
+            ),
         )
     }
 
@@ -211,7 +230,19 @@ impl IpStackTcpStream {
         if let Ok(p) = self.create_rev_packet(RST | ACK, TTL, None, Vec::new()) {
             let _ = self.packet_sender.try_send(p);
         }
+        self.close();
+    }
+
+    fn wake_writer(&mut self) {
+        if let Some(waker) = self.write_notify.take() {
+            waker.wake();
+        }
+    }
+
+    fn close(&mut self) {
         self.tcb.change_state(TcpState::Closed);
+        self.shutdown.ready();
+        self.wake_writer();
     }
 }
 
@@ -238,8 +269,7 @@ impl IpStackTcpStream {
                         self.create_rev_packet(RST | ACK, TTL, None, Vec::new())
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
                     );
-                    self.tcb.change_state(TcpState::Closed);
-                    self.shutdown.ready();
+                    self.close();
                     return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
                 }
                 let pkt = self.tcb.inflight_packets.first().unwrap();
@@ -254,9 +284,10 @@ impl IpStackTcpStream {
                 }
             }
             if let Some(packet) = self.packet_to_send.take() {
-                self.packet_sender
-                    .try_send(packet)
-                    .or(Err(ErrorKind::UnexpectedEof))?;
+                if self.packet_sender.try_send(packet).is_err() {
+                    self.close();
+                    return Poll::Ready(Err(ErrorKind::UnexpectedEof.into()));
+                }
             }
             if *self.tcb.get_state() == TcpState::Closed {
                 self.shutdown.ready();
@@ -268,8 +299,7 @@ impl IpStackTcpStream {
                     self.create_rev_packet(NON, DROP_TTL, None, Vec::new())
                         .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
                 );
-                self.tcb.change_state(TcpState::Closed);
-                self.shutdown.ready();
+                self.close();
                 return Poll::Ready(Err(Error::from(ErrorKind::ConnectionAborted)));
             }
 
@@ -315,14 +345,13 @@ impl IpStackTcpStream {
             }
             if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
                 trace!("timeout reached for {:?}", self.dst_addr);
+                self.close();
                 self.packet_sender
                     .try_send(
                         self.create_rev_packet(RST | ACK, TTL, None, Vec::new())
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
                     )
                     .or(Err(ErrorKind::UnexpectedEof))?;
-                self.tcb.change_state(TcpState::Closed);
-                self.shutdown.ready();
                 return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
             if *self.tcb.get_state() == TcpState::FinWait1(true) {
@@ -355,8 +384,7 @@ impl IpStackTcpStream {
                             self.create_rev_packet(NON, DROP_TTL, None, Vec::new())
                                 .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?,
                         );
-                        self.tcb.change_state(TcpState::Closed);
-                        self.shutdown.ready();
+                        self.close();
                         return Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
                     let packet_status = self.tcb.check_pkt_type(&t, &p.payload);
@@ -370,6 +398,7 @@ impl IpStackTcpStream {
                             self.tcb.change_last_ack(t.inner().acknowledgment_number);
                             self.tcb.change_send_window(t.inner().window_size);
                             self.tcb.change_state(TcpState::Established);
+                            self.wake_writer();
                         }
                     } else if *self.tcb.get_state() == TcpState::Established {
                         let has_payload = !p.payload.is_empty();
@@ -380,10 +409,7 @@ impl IpStackTcpStream {
                             match packet_status {
                                 PacketStatus::WindowUpdate => {
                                     self.tcb.change_send_window(t.inner().window_size);
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    };
+                                    self.wake_writer();
                                 }
                                 PacketStatus::Invalid => continue,
                                 PacketStatus::KeepAlive => {
@@ -395,10 +421,7 @@ impl IpStackTcpStream {
                                                 std::io::Error::new(ErrorKind::InvalidData, e)
                                             })?,
                                     );
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    }
+                                    self.wake_writer();
                                 }
                                 PacketStatus::RetransmissionRequest => {
                                     self.tcb.change_send_window(t.inner().window_size);
@@ -410,18 +433,12 @@ impl IpStackTcpStream {
                                 PacketStatus::NewPacket => {
                                     self.tcb.change_last_ack(t.inner().acknowledgment_number);
                                     self.tcb.change_send_window(t.inner().window_size);
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    };
+                                    self.wake_writer();
                                 }
                                 PacketStatus::Ack => {
                                     self.tcb.change_last_ack(t.inner().acknowledgment_number);
                                     self.tcb.change_send_window(t.inner().window_size);
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    };
+                                    self.wake_writer();
                                 }
                             };
                         }
@@ -470,7 +487,10 @@ impl IpStackTcpStream {
                         }
                     }
                 }
-                Poll::Ready(None) => return Poll::Ready(Ok(0)),
+                Poll::Ready(None) => {
+                    self.close();
+                    return Poll::Ready(Ok(0));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -485,7 +505,8 @@ impl IpStackTcpStream {
     ) -> Poll<std::io::Result<usize>> {
         if *self.tcb.get_state() != TcpState::Established {
             if matches!(self.tcb.get_state(), &TcpState::SynReceived(_)) {
-                cx.waker().wake_by_ref();
+                // The read side processes the handshake ACK or terminal error.
+                self.write_notify = Some(cx.waker().clone());
                 return Poll::Pending;
             }
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
@@ -575,7 +596,7 @@ impl IpStackTcpStream {
         // connect (so the client commits to it) and then die, instead of
         // staying unresponsive so the IPv4 attempt can win.
         if matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
-            self.shutdown.ready();
+            self.close();
             return Poll::Ready(Ok(()));
         }
         if matches!(self.shutdown, Shutdown::Ready) {
@@ -653,6 +674,119 @@ mod tests {
         task::Wake,
     };
 
+    #[tokio::test]
+    async fn writes_respect_peer_mss_and_local_limits() {
+        // Keep the stack's large default MTU: the peer's SYN must prevent
+        // oversized DF packets when this stream feeds a forwarded VPN path.
+        for (ipv6, advertised, mtu, window, expected) in [
+            (false, Some(1460), 16384, 65535, 1460),
+            (true, Some(1440), 16384, 65535, 1440),
+            (false, None, 16384, 65535, 536),
+            (true, None, 16384, 65535, 1220),
+            (false, Some(9000), 1500, 65535, 1460),
+            (true, Some(9000), 1500, 65535, 1440),
+            (false, Some(1460), 16384, 100, 100),
+            (false, Some(1), 16384, 65535, 1),
+        ] {
+            let (packet_sender, packet_receiver) = async_channel::unbounded();
+            let (_stream_sender, stream_receiver) = async_channel::unbounded();
+            let (src, dst): (SocketAddr, SocketAddr) = if ipv6 {
+                (
+                    "[fd00::1]:1000".parse().unwrap(),
+                    "[fd00::2]:2000".parse().unwrap(),
+                )
+            } else {
+                (
+                    "10.0.0.1:1000".parse().unwrap(),
+                    "10.0.0.2:2000".parse().unwrap(),
+                )
+            };
+            let mut syn = etherparse::TcpHeader::new(1000, 2000, 999, window);
+            syn.syn = true;
+            if let Some(mss) = advertised {
+                syn.set_options(&[
+                    etherparse::TcpOptionElement::Noop,
+                    etherparse::TcpOptionElement::MaximumSegmentSize(mss),
+                ])
+                .unwrap();
+            }
+            let mut stream = Box::pin(
+                IpStackTcpStream::new(
+                    src,
+                    dst,
+                    (&syn).into(),
+                    packet_sender,
+                    stream_receiver,
+                    mtu,
+                    Duration::from_secs(60),
+                )
+                .unwrap(),
+            );
+            stream.tcb.change_state(TcpState::Established);
+            stream.tcb.change_send_window(window);
+            let bytes = vec![0xab; 8192];
+            let written = poll_fn(|cx| stream.as_mut().poll_write_inner(cx, &bytes))
+                .await
+                .unwrap();
+            assert_eq!(
+                written, expected,
+                "ipv6={ipv6}, MSS={advertised:?}, MTU={mtu}"
+            );
+            let packet = packet_receiver.recv().await.unwrap();
+            assert_eq!(packet.payload, bytes[..expected]);
+            // Retransmitting must preserve the same segmentation limit.
+            let TransportHeader::Tcp(header) = packet.transport else {
+                panic!("not TCP")
+            };
+            // Leave room in the window to isolate retransmission sizing
+            // from the existing send-window accounting.
+            stream.tcb.change_send_window(u16::MAX);
+            stream.tcb.retransmission = Some(header.sequence_number);
+            poll_fn(|cx| stream.as_mut().poll_flush_inner(cx))
+                .await
+                .unwrap();
+            let retry = packet_receiver.recv().await.unwrap();
+            assert_eq!(retry.payload, bytes[..expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_mss_syn_is_rejected() {
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let (_stream_sender, stream_receiver) = async_channel::unbounded();
+        let mut syn = etherparse::TcpHeader::new(1000, 2000, 999, u16::MAX);
+        syn.syn = true;
+        syn.set_options(&[TcpOptionElement::MaximumSegmentSize(0)])
+            .unwrap();
+        let result = IpStackTcpStream::new(
+            "10.0.0.1:1000".parse().unwrap(),
+            "10.0.0.2:2000".parse().unwrap(),
+            (&syn).into(),
+            packet_sender,
+            stream_receiver,
+            16384,
+            Duration::from_secs(60),
+        );
+        assert!(result.unwrap_err().to_string().contains("zero MSS"));
+    }
+
+    #[tokio::test]
+    async fn effective_mss_accounts_for_header_options() {
+        let (packet_sender, _packet_receiver) = async_channel::unbounded();
+        let mut stream = unestablished_stream(packet_sender);
+        stream.mtu = 16384;
+        stream.peer_mss = 1460;
+        assert_eq!(stream.calculate_payload_len(20, 32), 1448);
+        assert_eq!(stream.calculate_payload_len(24, 32), 1444);
+        stream.src_addr = "[fd00::1]:1000".parse().unwrap();
+        stream.dst_addr = "[fd00::2]:2000".parse().unwrap();
+        stream.peer_mss = 1440;
+        assert_eq!(stream.calculate_payload_len(40, 32), 1428);
+        assert_eq!(stream.calculate_payload_len(48, 32), 1420);
+        stream.peer_mss = 1;
+        assert_eq!(stream.calculate_payload_len(40, 32), 0);
+    }
+
     #[derive(Default)]
     struct WakeCounter(AtomicUsize);
 
@@ -663,6 +797,84 @@ mod tests {
 
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_handshake_wakes_writer_only_on_ack_reset_or_timeout() {
+        for outcome in ["ack", "reset", "timeout"] {
+            let (output, packets) = async_channel::unbounded();
+            let (input, incoming) = async_channel::unbounded();
+            let mut syn = etherparse::TcpHeader::new(1000, 2000, 999, u16::MAX);
+            syn.syn = true;
+            let timeout = Duration::from_secs(5);
+            let mut stream = Box::pin(
+                IpStackTcpStream::new(
+                    "10.0.0.1:1000".parse().unwrap(),
+                    "10.0.0.2:2000".parse().unwrap(),
+                    (&syn).into(),
+                    output,
+                    incoming,
+                    1500,
+                    timeout,
+                )
+                .unwrap(),
+            );
+            let count = Arc::new(WakeCounter::default());
+            let waker = Waker::from(count.clone());
+            let mut writer = Context::from_waker(&waker);
+            assert!(stream
+                .as_mut()
+                .poll_write_inner(&mut writer, b"hello")
+                .is_pending());
+
+            let read_waker = Waker::from(Arc::new(WakeCounter::default()));
+            let mut reader = Context::from_waker(&read_waker);
+            let mut buf = [0];
+            assert!(stream
+                .as_mut()
+                .poll_read_inner(&mut reader, &mut buf)
+                .is_pending());
+            assert!(
+                matches!(packets.try_recv().unwrap().transport, TransportHeader::Tcp(tcp) if tcp.syn && tcp.ack)
+            );
+            assert!(stream
+                .as_mut()
+                .poll_write_inner(&mut writer, b"hello")
+                .is_pending());
+            assert_eq!(count.0.load(Ordering::Relaxed), 0);
+
+            if outcome == "timeout" {
+                tokio::time::advance(timeout + Duration::from_millis(1)).await;
+            } else {
+                let mut reply = etherparse::TcpHeader::new(1000, 2000, 1000, u16::MAX);
+                reply.ack = true;
+                reply.rst = outcome == "reset";
+                reply.acknowledgment_number = stream.tcb.get_seq();
+                input
+                    .try_send(NetworkPacket {
+                        ip: IpHeader::Ipv4(
+                            Ipv4Header::new(20, TTL, IpNumber::TCP, [10, 0, 0, 1], [10, 0, 0, 2])
+                                .unwrap(),
+                        ),
+                        transport: TransportHeader::Tcp(reply),
+                        payload: Vec::new(),
+                        teardown_generation: None,
+                    })
+                    .unwrap();
+            }
+            let read = stream.as_mut().poll_read_inner(&mut reader, &mut buf);
+            assert_eq!(count.0.load(Ordering::Relaxed), 1, "{outcome}");
+            let write = stream.as_mut().poll_write_inner(&mut writer, b"hello");
+            if outcome == "ack" {
+                assert!(read.is_pending());
+                assert!(matches!(write, Poll::Ready(Ok(5))));
+            } else {
+                assert!(matches!(read, Poll::Ready(Err(_))));
+                assert!(
+                    matches!(write, Poll::Ready(Err(e)) if e.kind() == ErrorKind::NotConnected)
+                );
+            }
         }
     }
 
@@ -682,6 +894,7 @@ mod tests {
             packet_to_send: None,
             tcb,
             mtu: 1500,
+            peer_mss: u16::MAX,
             shutdown: Shutdown::None,
             write_notify: None,
             session_generation: 1,
@@ -721,6 +934,7 @@ mod tests {
             packet_to_send: None,
             tcb,
             mtu: 1500,
+            peer_mss: u16::MAX,
             shutdown: Shutdown::None,
             write_notify: Some(Waker::from(wake_counter.clone())),
             session_generation: 1,
@@ -798,6 +1012,7 @@ mod tests {
             packet_to_send: None,
             tcb,
             mtu: 1500,
+            peer_mss: u16::MAX,
             shutdown: Shutdown::None,
             write_notify: None,
             session_generation: 1,
@@ -832,6 +1047,7 @@ mod tests {
             packet_to_send: None,
             tcb,
             mtu: 1500,
+            peer_mss: u16::MAX,
             shutdown: Shutdown::None,
             write_notify: None,
             session_generation: 1,
@@ -878,6 +1094,7 @@ mod tests {
             packet_to_send: None,
             tcb,
             mtu: 1500,
+            peer_mss: u16::MAX,
             shutdown: Shutdown::None,
             write_notify: None,
             session_generation: 1,
